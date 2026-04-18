@@ -905,7 +905,7 @@ async function main() {
   const args = parseArgs();
   const ticker = (args.ticker ?? args.t ?? '').toUpperCase();
   if (!ticker) {
-    console.error('Usage: npx tsx src/initial-max-runner.ts --ticker NVDA [--max-rounds 20] [--model MODEL] [--score-only] [--skip-polish] [--tag label]');
+    console.error('Usage: npx tsx src/initial-max-runner.ts --ticker NVDA [--max-rounds 20] [--model MODEL] [--score-only] [--skip-polish] [--tag label] [--skill tw-stock]');
     process.exit(1);
   }
 
@@ -915,6 +915,7 @@ async function main() {
   const model = args.model ?? DEFAULT_MODEL;
   const investorNote = args.why ?? args.note ?? '';
   const tag = args.tag ?? new Date().toISOString().slice(5, 10).replace('-', '');
+  const skillName = args.skill ?? args.market?.toLowerCase() === 'tw' ? 'tw-stock' : 'initial-max';
 
   console.log('╔══════════════════════════════════════╗');
   console.log('║       Initial MAX Runner             ║');
@@ -922,6 +923,7 @@ async function main() {
   console.log(`Ticker:     ${ticker}`);
   console.log(`Max rounds: ${maxRounds}`);
   console.log(`Model:      ${model}`);
+  console.log(`Skill:      ${skillName}`);
   console.log(`Score only: ${scoreOnly}`);
   if (investorNote) {
     console.log(`Why:        ${investorNote}`);
@@ -938,10 +940,11 @@ async function main() {
   }
 
   // Load SKILL and program prompt
-  const skillPath = path.join(PROJECT_ROOT, 'skills', 'initial-max', 'SKILL.md');
+  const skillPath = path.join(PROJECT_ROOT, 'skills', skillName, 'SKILL.md');
   const programPath = path.join(__dirname, 'program-initial-max.md');
   if (!fs.existsSync(skillPath)) {
     console.error(`SKILL not found: ${skillPath}`);
+    console.error(`Available skills: ${fs.readdirSync(path.join(PROJECT_ROOT, 'skills')).join(', ')}`);
     process.exit(1);
   }
   const skillContent = fs.readFileSync(skillPath, 'utf-8');
