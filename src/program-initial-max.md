@@ -76,3 +76,45 @@ FUTU 報告（96/100）的特點，供你參考對標：
 - 生意：Leaf Li 40+ 訪談引言，7年財務表，DCF含21.4% IRR拆分（15.1%成長+5.2%估值+1.1%回購）
 - 組織：各市場滲透率均來自20-F年報，清楚標出處
 - 人：Leaf Li 格局觀多年敘事，2007-2026完整創業故事，多個第一性原理決策說明
+
+---
+
+## 台股研究補充指引（Taiwan Stock Addendum）
+
+當研究標的為台股（4位數字代號，或 .TW 後綴），以下規則取代或補充原有指引：
+
+### 資料來源替換
+
+| 原始（美股）| 台股替代 |
+|-----------|---------|
+| ninja_api earnings | fetch_url 公開資訊觀測站 MOPS |
+| ninja_api earningstranscript | fetch_url mops.twse.com.tw/mops/web/t100sb01 |
+| SEC EDGAR | 公開資訊觀測站年報下載 |
+| 股票代號（NVDA）| 4位數字（2330）或 2330.TW |
+
+### 財務數據抓取順序
+1. 先呼叫 `fetch_url` 抓取 MOPS 財報頁面
+2. 再用 `fetch_url` 抓取 Goodinfo（https://goodinfo.tw/tw/StockDetail.asp?STOCK_ID={代號}）
+3. 月營收：fetch_url 台灣證交所（每月 10 日更新，至少追蹤 12 個月）
+4. 如為 TSM/UMC 等有 ADR 者，可補充 ninja_api
+
+### CEO 訪談搜尋策略
+每輪優先搜尋：
+- `web_search("{CEO名} 商業周刊 OR 天下雜誌 訪談", 3)`
+- `web_search("{CEO名} TEDx OR 演講 逐字稿", 2)`
+- `fetch_url` 直接抓取找到的訪談文章 URL
+
+### 台股特有必達項
+- [ ] 月營收趨勢（12 個月，來自 TWSE）
+- [ ] 兩岸地緣政治風險分析（必有專段）
+- [ ] 台幣計價 DCF（無風險利率：台灣 10 年期公債，約 1.5–2%）
+- [ ] 竹科/中科/南科或海外廠佈局
+- [ ] 前五大客戶集中度（來自年報）
+
+### 報告輸出路徑
+`data/companies/{代號}/{代號}_TW_Research.md`（取代原 _Initial_MAX.md）
+
+### 引言品質標準（台股版）
+- 引言須用「…」或 "…" 包住
+- 出處格式：（來源：{媒體名稱}，{日期}，[文章標題]({URL})）
+- 法說會引言格式：（來源：{公司名} {年}Q{季} 法說會，[逐字稿]({MOPS_URL})）

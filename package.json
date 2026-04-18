@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "initial-max": "tsx src/initial-max-runner.ts",
-    "score": "tsx src/initial-max-scorer.ts"
+    "score": "tsx src/initial-max-scorer.ts",
+    "tw-research": "tsx src/initial-max-runner.ts --market TW",
+    "tw-score": "tsx src/initial-max-scorer.ts --market TW"
   },
   "devDependencies": {
     "@types/node": "^24.10.1",

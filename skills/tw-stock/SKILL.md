@@ -1,0 +1,205 @@
+---
+name: tw-stock-research
+description: 台股深度研究技能。針對台灣證交所/櫃買中心上市公司，整合公開資訊觀測站(MOPS)、台灣證交所(TWSE)、商業周刊、天下雜誌等本地資料來源，依張磊四維框架執行迭代研究，達 ≥95/100 分或 20 輪上限。觸發：「台股研究 [代號]」「tw [代號]」「/tw-stock [代號]」。
+---
+
+# Taiwan Stock Research Skill（台股深度研究框架）
+
+**目的**：以台灣上市/上櫃公司為對象，執行機構級投資研究。品質標竿為 95/100 分，採張磊（高瓴資本）四維框架「環境→生意→組織→人」評分，每輪補充缺口研究，直到總分 **≥95/100** 且**各維度達最低分**（環境≥16、生意≥30、組織≥16、人≥20）、**DCF 估值為必達項**，或達 20 輪上限。
+
+---
+
+## 台股適用範圍
+
+- 台灣證券交易所（TWSE）上市公司
+- 證券櫃檯買賣中心（TPEx/OTC）上櫃公司
+- 股票代號格式：4 位數字（如 2330、2454、6505）或 .TW 後綴
+- 研究語言：繁體中文為主，關鍵數字、國際引文保留英文
+
+---
+
+## 可用工具
+
+```
+list_company_files(ticker)        — 先查：列出該公司目錄下已有檔案與 transcripts
+query_companies_db(ticker)        — 查資料庫：companies_database.json 中該公司條目
+search_data_for_company(ticker)   — 搜尋 data/ 下與該公司/CEO 相關內容
+read_project_file(path)           — 讀取 data/ 下任意檔案
+fetch_url(url)                    — 抓取 URL 完整內容（MOPS、TWSE、媒體文章等）
+web_search(query, count)          — 搜尋網頁，最多 5 次/輪
+ninja_api(action, ticker, ...)    — 僅用於有 ADR 之台股（TSM、UMC 等）
+write_research_section(ticker, filename, content, mode, section_anchor?)
+                                  — 寫入 data/companies/{TICKER}/{TICKER}_TW_Research.md
+read_research_file(ticker, filename)
+                                  — 讀取現有研究檔案
+```
+
+**主要輸出檔案**：`data/companies/{代號}/{代號}_TW_Research.md`
+
+---
+
+## 台股資料來源優先順序
+
+### 財務數據
+1. **公開資訊觀測站（MOPS）** — https://mops.twse.com.tw
+   - 財報：`ajax_t05st10_ifrs?co_id={代號}`
+   - 法說會：`t100sb01?co_id={代號}&year={民國年}`
+2. **台灣證券交易所（TWSE）** — https://www.twse.com.tw
+   - 月營收：`/rwd/zh/afterTrading/FMSRFK?stockNo={代號}`（每月 10 日更新）
+3. **台灣股市資訊網 Goodinfo** — `https://goodinfo.tw/tw/StockDetail.asp?STOCK_ID={代號}`
+4. **CMoney** — https://www.cmoney.tw
+5. **ninja_api** — 僅適用 TSM（2330）、UMC（2303）等有 ADR 者
+
+### 法說會與管理層語錄
+1. MOPS 法說會 — `https://mops.twse.com.tw/mops/web/t100sb01`
+2. **商業周刊** — https://www.businessweekly.com.tw
+3. **天下雜誌** — https://www.cw.com.tw
+4. **數位時代** — https://www.bnext.com.tw
+5. **鉅亨網 Anue** — https://news.cnyes.com
+6. **MoneyDJ 理財網** — https://www.moneydj.com
+
+### 產業環境資料
+1. **工業技術研究院（ITRI）** — https://www.itri.org.tw
+2. **資策會 MIC** — https://mic.iii.org.tw
+3. **金管會** — https://www.fsc.gov.tw
+4. **經濟部工業局** — https://www.moeaidb.gov.tw
+
+---
+
+## 搜尋預算分配策略
+
+每輪最多 5 次 web_search。依缺分高低分配：
+
+| 缺口維度 | 優先工具 | 搜尋模板 |
+|---------|---------|---------|
+| 財務數據 | fetch_url MOPS | `ajax_t05st10_ifrs?co_id={代號}` |
+| 月營收 | fetch_url TWSE | `/rwd/zh/afterTrading/FMSRFK?stockNo={代號}` |
+| CEO 訪談 | web_search × 2 | `"{CEO名}" 訪談 商業周刊 OR 天下雜誌` |
+| 法說逐字稿 | web_search × 1 | `"{公司名}" {年} 法人說明會 site:mops.twse.com.tw` |
+| 產業環境 | web_search × 1 | `"{產業}" 台灣 市場規模 ITRI OR MIC {年}` |
+| CEO 演講 | web_search × 1 | `"{CEO名}" TEDx OR 演講 逐字稿` |
+| 有 ADR 財報 | ninja_api | `ninja_api(action: earnings_historical, ticker: TSM)` |
+
+---
+
+## 台股特有評分維度
+
+### 一、環境（滿分 20 分，最低 16 分）
+必須涵蓋：
+- 台灣半導體/科技供應鏈定位（CoWoS、先進封裝、AI 伺服器鏈）
+- **兩岸地緣政治風險**（客戶分散程度、中國營收佔比）— 必達項
+- 台灣政府補貼與法規（國科會補助、投資抵減）
+- 匯率影響（台幣兌美元對毛利率敏感度）
+- 主要海外競爭者對比（韓國三星、SK 海力士等）
+- TAM 需附明確數字與來源（ITRI/MIC 報告）
+
+### 二、生意（滿分 35 分，最低 30 分）
+必須涵蓋：
+- 台灣 GAAP（TIFRS）財報解讀（近 5 年）
+- **月營收趨勢分析**（最近 12 個月，來自 TWSE）— 必達項
+- 毛利率趨勢與產品組合分析
+- 資本支出週期與折舊壓力
+- **前五大客戶集中度**（來自年報）— 必達項
+- **台幣計價 DCF**（無風險利率：台灣 10 年期公債 ~1.5–2%）— 必達項
+- CEO 直接引言 ≥25 則（商業模式維度）
+
+### 三、組織（滿分 20 分，最低 16 分）
+必須涵蓋：
+- **台灣工廠分布**（竹科、中科、南科）— 必達項
+- 海外製造據點（東南亞、美國、日本布局）
+- 研發費用佔營收比（R&D intensity，近 5 年趨勢）
+- ESG 評級（台灣永續指數、永續報告書）
+- 公司治理（獨立董事、關係人交易揭露）
+
+### 四、人（滿分 25 分，最低 20 分）
+CEO 故事線必須涵蓋：
+- 學經歷背景（成長環境、求學、職涯起點）
+- 關鍵決策時刻（創業或重大轉型）
+- 管理哲學直接引言（含引號 + 出處 + 日期）
+- 近 3 年重要公開發言（商業周刊、天下、法說會）
+- 各時期訪談（不同年代/階段，時間軸鋪陳）
+
+台股 CEO 資料來源優先順序：
+1. 商業周刊封面故事
+2. 天下雜誌企業家專題
+3. TEDxTaipei / TEDxTaichung 演講逐字稿
+4. MOPS 股東會議事錄
+5. 法說會 Q&A 逐字稿
+
+---
+
+## 主檔結構（依序）
+
+```
+{代號}_TW_Research.md
+├── IRR 模型與關鍵假設（情境分析表，台幣計價）
+├── 結論總結（1–2 段）
+├── KEY QUESTION
+├── 評分總表
+├── 一、環境
+│   ├── 1.1 產業起源與演進
+│   ├── 1.2 台灣市場定位與競爭格局
+│   ├── 1.3 兩岸地緣政治風險（必達）
+│   └── 1.4 法規與政策環境
+├── 二、生意
+│   ├── 2.1 商業模式（≥25 則 CEO 直引言）
+│   ├── 2.2 財務分析（TIFRS 近 5 年）
+│   ├── 2.3 月營收趨勢（12 個月，必達）
+│   ├── 2.4 客戶集中度（前五大，必達）
+│   └── 2.5 台幣 DCF 估值（必達）
+├── 三、組織
+│   ├── 3.1 廠區分布（竹科/中科/南科/海外，必達）
+│   ├── 3.2 研發能力與 ESG
+│   └── 3.3 公司治理
+├── 四、人
+│   ├── 4.1 CEO 故事線（時間軸）
+│   └── 4.2 管理團隊
+└── 五、評分表
+```
+
+---
+
+## 品質要求
+
+1. **每個子點至少 5 則管理層原話**：須引號包住 + 出處 + 日期
+2. **嚴格出處標準**：每條數字必須附可點擊 URL
+   - 出處格式：`（來源：{媒體名稱}，{日期}，[文章標題]({URL})）`
+   - 法說會：`（來源：{公司名} {年}Q{季} 法說會，[逐字稿]({MOPS_URL})）`
+3. **非直接引述不計**：間接描述不算入「5 則」計數
+4. **地理分部數字必須有年報頁碼**：`（來源：{代號} 年報 {年} p.XX，[連結]({URL})）`
+5. **禁止 append 堆文末**：補充時優先 replace_section 整節重寫
+6. **DCF 必達**：`dcf_config.json` 假設須合理，附調整理由
+
+---
+
+## 輸出 JSON 格式
+
+完成工具執行後，輸出純 JSON（不加 code fence）：
+
+```json
+{
+  "description": "short english description — which gaps were filled",
+  "files_written": ["2330_TW_Research.md", "transcripts/2330_CEO_2024_BWK.md"],
+  "interviews_added": 3,
+  "dimensions_addressed": ["生意→月營收", "人→CEO訪談"]
+}
+```
+
+---
+
+## 達標標準
+
+| 維度 | 滿分 | 最低門檻 |
+|------|------|---------|
+| 環境（含地緣政治）| 20 | 16 |
+| 生意（含台幣 DCF）| 35 | 30 |
+| 組織（含竹科/海外）| 20 | 16 |
+| 人（含台灣媒體引言）| 25 | 20 |
+| **總分** | **100** | **≥95** |
+
+**必達項**（缺一不達標）：
+- [ ] 台幣計價 DCF
+- [ ] 月營收趨勢（12 個月）
+- [ ] 兩岸地緣政治風險專段
+- [ ] 前五大客戶集中度
+- [ ] 竹科/中科/南科廠區分布
