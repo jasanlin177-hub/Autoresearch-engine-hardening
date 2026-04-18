@@ -111,19 +111,28 @@ function readResearchFiles(ticker: string): string {
 /** 檢查主檔是否每個必備子節（1.1～4.2）皆有實質內容；缺節或僅「待補充」視為未覆蓋。 */
 function checkAllSectionsCovered(mainContent: string): { allCovered: boolean; missing: string[] } {
   const missing: string[] = [];
+  const lines = mainContent.split('\n');
   for (const id of REQUIRED_SECTIONS) {
-    const re = new RegExp(`^##\\s*${id.replace('.', '\\.')}\\b.*$`, 'm');
-    const match = mainContent.match(re);
-    if (!match || match.index == null) {
+    // Find any heading line (##, ###, ####) that starts with the section number id (e.g. "1.1", "4.2")
+    const headingLineIdx = lines.findIndex(line => {
+      if (!line.startsWith('#')) return false;
+      const stripped = line.replace(/^#+\s*/, '');
+      return stripped.startsWith(id + ' ') || stripped.startsWith(id + '\t') || stripped === id;
+    });
+    if (headingLineIdx === -1) {
       missing.push(id);
       continue;
     }
-    const sectionStart = match.index! + match[0].length;
-    const after = mainContent.slice(sectionStart);
-    const nextHeading = after.match(/\n##\s/m);
-    const sectionEnd = nextHeading && nextHeading.index != null ? sectionStart + nextHeading.index : mainContent.length;
-    const body = mainContent.slice(sectionStart, sectionEnd).replace(/\s+/g, ' ').trim();
-    if (body.length < MIN_SECTION_CHARS || /^待補充\s*$/i.test(body)) missing.push(id);
+    // Gather body lines until next heading of same or higher level
+    const headingLevel = (lines[headingLineIdx].match(/^#+/) ?? [''])[0].length;
+    let body = '';
+    for (let i = headingLineIdx + 1; i < lines.length; i++) {
+      const m = lines[i].match(/^(#+)/);
+      if (m && m[1].length <= headingLevel) break;
+      body += lines[i] + '\n';
+    }
+    body = body.replace(/\s+/g, ' ').trim();
+    if (body.length < MIN_SECTION_CHARS || /^待補充\s*$/.test(body)) missing.push(id);
   }
   return { allCovered: missing.length === 0, missing };
 }
@@ -344,11 +353,31 @@ const SCORER_SYSTEM_PROMPT = `你是一位專業的投資研究品質評審。�
   "total": 數字
 }`;
 
+const SMALL_CAP_SUPPLEMENT = `
+
+---
+## ⚠️ 小型股例外條款（本次評分適用）
+
+本公司為**市值 < 30 億元台幣之小型上櫃股**，公開資訊稀缺，依以下寬鬆標準評分：
+
+1. **每子節引言門檻**：從 ≥5 則降為 ≥2 則（有 URL 出處即計分）
+2. **CEO 訪談 URL**：滿分門檻從 ≥25 篇降為 ≥5 篇真實連結（計算公式改為 min(訪談數/5, 1.0)×15）
+3. **達標條件**：總分 ≥ **60 分**，且各維度達最低分：環境≥12、生意≥22、組織≥10、人≥12
+4. **法說記錄不足**：若 MOPS 無法說記錄，新聞報導替代視同有效出處
+5. **資訊揭露不足原則**：若某維度分數受限於公司公開資訊義務不足（非研究品質問題），應給予該維度滿分的 70% 作為基準分，而非 0 分
+6. **不得因「小公司媒體曝光少」而大量扣分**；重點評估研究者是否盡力蒐集所有可得資料
+`;
+
 async function llmScore(
   ticker: string,
   reportContent: string,
   model = 'google/gemini-3.1-pro-preview',
+  isSmallCap = false,
 ): Promise<InitialMaxScore | null> {
+  const systemPrompt = isSmallCap
+    ? SCORER_SYSTEM_PROMPT + SMALL_CAP_SUPPLEMENT
+    : SCORER_SYSTEM_PROMPT;
+
   const userMessage = `請評分以下 ${ticker} 的研究報告：
 
 ${reportContent.slice(0, 80000)}`;
@@ -356,7 +385,7 @@ ${reportContent.slice(0, 80000)}`;
   try {
     const response = await chat(
       [
-        { role: 'system', content: SCORER_SYSTEM_PROMPT },
+        { role: 'system', content: systemPrompt },
         { role: 'user', content: userMessage },
       ],
       { model, maxTokens: 4096 },
@@ -391,12 +420,17 @@ ${reportContent.slice(0, 80000)}`;
     const 生意 = parsed['生意']?.score ?? 0;
     const 組織 = parsed['組織']?.score ?? 0;
     const 人 = parsed['人']?.score ?? 0;
+    const passTotal = isSmallCap ? 60 : PASS_TOTAL;
+    const min環境 = isSmallCap ? 12 : MIN_環境;
+    const min生意 = isSmallCap ? 22 : MIN_生意;
+    const min組織 = isSmallCap ? 10 : MIN_組織;
+    const min人 = isSmallCap ? 12 : MIN_人;
     const passThreshold =
-      total >= PASS_TOTAL &&
-      環境 >= MIN_環境 &&
-      生意 >= MIN_生意 &&
-      組織 >= MIN_組織 &&
-      人 >= MIN_人;
+      total >= passTotal &&
+      環境 >= min環境 &&
+      生意 >= min生意 &&
+      組織 >= min組織 &&
+      人 >= min人;
 
     return {
       環境: { score: 環境, max: 20, criteria: parsed['環境']?.criteria, gaps: parsed['環境']?.gaps ?? [] },
@@ -475,9 +509,11 @@ export async function scoreCompanyResearch(
   ticker: string,
   round = 0,
   model = 'google/gemini-3.1-pro-preview',
+  market = 'US',
 ): Promise<{ score: InitialMaxScore; gaps: InitialMaxGaps }> {
   const reportContent = readResearchFiles(ticker);
   const dir = getCompanyDir(ticker);
+  const isSmallCap = market.toUpperCase() === 'TW';
 
   let score: InitialMaxScore;
 
@@ -495,7 +531,7 @@ export async function scoreCompanyResearch(
   } else {
     // Try LLM scorer
     console.log(`[scorer] Running LLM scorer (${model}) for ${ticker}...`);
-    const llmResult = await llmScore(ticker, reportContent, model);
+    const llmResult = await llmScore(ticker, reportContent, model, isSmallCap);
 
     if (llmResult) {
       score = { ...llmResult, round };
@@ -553,9 +589,11 @@ async function main() {
 
   const model = args.model ?? 'google/gemini-3.1-pro-preview';
   const round = parseInt(args.round ?? '0', 10);
+  const market = args.market ?? 'US';
 
-  const { score } = await scoreCompanyResearch(ticker.toUpperCase(), round, model);
+  const { score } = await scoreCompanyResearch(ticker.toUpperCase(), round, model, market);
 
+  const passLabel = market.toUpperCase() === 'TW' ? '≥60 小型股門檻' : '≥95 且各維度達標';
   console.log('\n╔══════════════════════════════════════╗');
   console.log(`║  Initial MAX Score: ${ticker.padEnd(6)} ${String(score.total).padStart(3)}/100        ║`);
   console.log('╚══════════════════════════════════════╝');
@@ -563,7 +601,7 @@ async function main() {
   console.log(`  生意 (35pts): ${score.生意.score}`);
   console.log(`  組織 (20pts): ${score.組織.score}`);
   console.log(`  人   (25pts): ${score.人.score}`);
-  console.log(`  達標 (≥95 且各維度達標): ${score.passThreshold ? '✓ YES' : '✗ NO'}`);
+  console.log(`  達標 (${passLabel}): ${score.passThreshold ? '✓ YES' : '✗ NO'}`);
   if (score.環境.gaps.length) console.log('\n環境缺口:', score.環境.gaps.join('; '));
   if (score.生意.gaps.length) console.log('生意缺口:', score.生意.gaps.join('; '));
   if (score.組織.gaps.length) console.log('組織缺口:', score.組織.gaps.join('; '));

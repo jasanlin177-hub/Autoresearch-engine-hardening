@@ -913,6 +913,7 @@ async function main() {
   const scoreOnly = args['score-only'] === 'true';
   const skipPolish = args['skip-polish'] === 'true';
   const model = args.model ?? DEFAULT_MODEL;
+  const market = args.market ?? 'US';
   const investorNote = args.why ?? args.note ?? '';
   const tag = args.tag ?? new Date().toISOString().slice(5, 10).replace('-', '');
   const skillName = args.skill ?? args.market?.toLowerCase() === 'tw' ? 'tw-stock' : 'initial-max';
@@ -952,7 +953,7 @@ async function main() {
 
   // Baseline score
   console.log('\n═══ Baseline Scoring ═══');
-  const { score: baselineScore, gaps: baselineGaps } = await scoreCompanyResearch(ticker, 0, model);
+  const { score: baselineScore, gaps: baselineGaps } = await scoreCompanyResearch(ticker, 0, model, market);
   const baselineResult: RoundResult = {
     round: 0,
     commit: gitShortHash(),
@@ -1008,7 +1009,7 @@ async function main() {
 
       // Score new state
       console.log('Scoring...');
-      const { score: newScore } = await scoreCompanyResearch(ticker, round, model);
+      const { score: newScore } = await scoreCompanyResearch(ticker, round, model, market);
       const delta = newScore.total - prevScore;
       console.log(`Score: ${newScore.total}/100 (${delta >= 0 ? '+' : ''}${delta} from ${prevScore})`);
 
@@ -1083,7 +1084,7 @@ async function main() {
       } catch {}
       console.log(`Polish summary: ${polishDesc}`);
       console.log('Scoring after polish...');
-      const { score: afterPolish } = await scoreCompanyResearch(ticker, polishRoundId, model);
+      const { score: afterPolish } = await scoreCompanyResearch(ticker, polishRoundId, model, market);
       console.log(`Score after polish: ${afterPolish.total}/100`);
       const commitHash = gitCommit(`initial-max polish: ${polishDesc.slice(0, 55)} — score ${afterPolish.total}/100`);
       history.push({
