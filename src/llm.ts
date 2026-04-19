@@ -23,12 +23,45 @@ function loadEnv(): void {
 
 loadEnv();
 
-const API_KEY = process.env.OPENROUTER_API_KEY ?? '';
-const BASE_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const OPENROUTER_KEY   = process.env.OPENROUTER_API_KEY ?? '';
+const GOOGLE_STUDIO_KEY = process.env.GOOGLE_AI_STUDIO_API_KEY ?? '';
+const OPENROUTER_URL   = 'https://openrouter.ai/api/v1/chat/completions';
+const GOOGLE_STUDIO_URL = 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions';
 
-if (!API_KEY) {
-  console.error('OPENROUTER_API_KEY not found. Set it in .env at project root (15.autoresearch/.env)');
+// ── timeout for Google AI Studio before falling back (ms) ──
+const GOOGLE_TIMEOUT_MS = 90_000;
+
+if (!GOOGLE_STUDIO_KEY && !OPENROUTER_KEY) {
+  console.error(
+    '[llm] No API key found.\n' +
+    '  Set GOOGLE_AI_STUDIO_API_KEY in .env (free, from https://aistudio.google.com)\n' +
+    '  or OPENROUTER_API_KEY (from https://openrouter.ai)\n' +
+    '  You can set both — Google AI Studio will be tried first.',
+  );
   process.exit(1);
+}
+
+// ── Model name mapping: OpenRouter → Google AI Studio ──
+// OpenRouter uses "google/gemini-X" prefixes; Google Studio uses bare names.
+function toGoogleModel(model: string): string {
+  // Strip "google/" prefix if present
+  const bare = model.replace(/^google\//, '');
+  // Known mappings
+  const MAP: Record<string, string> = {
+    'gemini-3.1-pro-preview':  'gemini-2.5-pro-preview-05-06',
+    'gemini-3.1-flash-preview': 'gemini-2.0-flash',
+    'gemini-2.5-pro-preview':  'gemini-2.5-pro-preview-05-06',
+    'gemini-2.5-flash-preview': 'gemini-2.5-flash-preview-04-17',
+    'gemini-2.0-flash':        'gemini-2.0-flash',
+    'gemini-2.0-pro':          'gemini-2.0-pro',
+    'gemini-1.5-pro':          'gemini-1.5-pro',
+    'gemini-1.5-flash':        'gemini-1.5-flash',
+  };
+  return MAP[bare] ?? bare;
+}
+
+function isGoogleModel(model: string): boolean {
+  return model.startsWith('google/') || model.startsWith('gemini-');
 }
 
 export interface Message {
@@ -57,45 +90,58 @@ export interface ChatResult {
   content: string | null;
   toolCalls: ToolCall[];
   usage: { promptTokens: number; completionTokens: number };
+  provider?: 'google-studio' | 'openrouter';
 }
 
-export async function chat(
+// ── Internal: call a single endpoint ──
+async function callEndpoint(
+  url: string,
+  apiKey: string,
+  model: string,
   messages: Message[],
-  options?: {
-    model?: string;
-    tools?: ToolDef[];
-    toolChoice?: 'auto' | 'none';
-    maxTokens?: number;
-  },
+  options: { tools?: ToolDef[]; toolChoice?: 'auto' | 'none'; maxTokens?: number },
+  timeoutMs?: number,
 ): Promise<ChatResult> {
-  const model = options?.model ?? 'google/gemini-3-flash-preview';
-
   const body: Record<string, unknown> = {
     model,
     messages,
-    max_tokens: options?.maxTokens ?? 16384,
+    max_tokens: options.maxTokens ?? 16384,
     stream: false,
   };
 
-  if (options?.tools?.length) {
+  if (options.tools?.length) {
     body.tools = options.tools;
     body.tool_choice = options.toolChoice ?? 'auto';
   }
 
-  const res = await fetch(BASE_URL, {
+  const isOpenRouter = url.includes('openrouter.ai');
+  const headers: Record<string, string> = {
+    'Authorization': `Bearer ${apiKey}`,
+    'Content-Type': 'application/json',
+  };
+  if (isOpenRouter) {
+    headers['HTTP-Referer'] = 'https://investment-ai.local';
+    headers['X-Title'] = 'AutoResearch';
+  }
+
+  const fetchPromise = fetch(url, {
     method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${API_KEY}`,
-      'Content-Type': 'application/json',
-      'HTTP-Referer': 'https://investment-ai.local',
-      'X-Title': 'AutoResearch',
-    },
+    headers,
     body: JSON.stringify(body),
   });
 
+  const res = timeoutMs
+    ? await Promise.race([
+        fetchPromise,
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`Timeout after ${timeoutMs / 1000}s`)), timeoutMs),
+        ),
+      ])
+    : await fetchPromise;
+
   if (!res.ok) {
     const errText = await res.text();
-    throw new Error(`OpenRouter ${res.status}: ${errText.slice(0, 500)}`);
+    throw new Error(`HTTP ${res.status}: ${errText.slice(0, 300)}`);
   }
 
   const data = (await res.json()) as any;
@@ -109,6 +155,63 @@ export async function chat(
       completionTokens: data.usage?.completion_tokens ?? 0,
     },
   };
+}
+
+// ── Public: chat with automatic fallback ──
+export async function chat(
+  messages: Message[],
+  options?: {
+    model?: string;
+    tools?: ToolDef[];
+    toolChoice?: 'auto' | 'none';
+    maxTokens?: number;
+  },
+): Promise<ChatResult> {
+  const requestedModel = options?.model ?? 'google/gemini-3.1-pro-preview';
+  const opts = {
+    tools: options?.tools,
+    toolChoice: options?.toolChoice,
+    maxTokens: options?.maxTokens,
+  };
+
+  // ── Try Google AI Studio first (if key is set and model is a Google model) ──
+  if (GOOGLE_STUDIO_KEY && isGoogleModel(requestedModel)) {
+    const googleModel = toGoogleModel(requestedModel);
+    try {
+      const result = await callEndpoint(
+        GOOGLE_STUDIO_URL, GOOGLE_STUDIO_KEY, googleModel,
+        messages, opts, GOOGLE_TIMEOUT_MS,
+      );
+      console.log(`  [llm] Google AI Studio (${googleModel}) ✓`);
+      return { ...result, provider: 'google-studio' };
+    } catch (err: any) {
+      const msg: string = err.message ?? '';
+      const is429  = msg.includes('429') || msg.toLowerCase().includes('quota') || msg.toLowerCase().includes('rate');
+      const isTimeout = msg.toLowerCase().includes('timeout');
+      if (is429) {
+        console.warn(`  [llm] Google AI Studio quota exceeded → falling back to OpenRouter`);
+      } else if (isTimeout) {
+        console.warn(`  [llm] Google AI Studio timed out (${GOOGLE_TIMEOUT_MS / 1000}s) → falling back to OpenRouter`);
+      } else {
+        console.warn(`  [llm] Google AI Studio error: ${msg.slice(0, 120)} → falling back to OpenRouter`);
+      }
+    }
+  }
+
+  // ── Fallback: OpenRouter ──
+  if (!OPENROUTER_KEY) {
+    throw new Error(
+      '[llm] Google AI Studio failed and OPENROUTER_API_KEY is not set. ' +
+      'Add it to .env to enable fallback.',
+    );
+  }
+
+  const result = await callEndpoint(
+    OPENROUTER_URL, OPENROUTER_KEY, requestedModel,
+    messages, opts,
+  );
+  console.log(`  [llm] OpenRouter (${requestedModel}) ✓`);
+  return { ...result, provider: 'openrouter' };
 }
 
 export function getEnv(key: string): string {
