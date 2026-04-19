@@ -36,8 +36,12 @@ The system:
 ### Requirements
 
 - Node.js 18+
-- OpenRouter API key (required — model: `google/gemini-3.1-pro-preview` by default)
+- At least one of the following API keys:
+  - **Google AI Studio API key** (free, primary) — get it at https://aistudio.google.com
+  - **OpenRouter API key** (pay-per-token, fallback) — get it at https://openrouter.ai
 - Optional: Brave Search API key (improves web search quality)
+
+The system tries **Google AI Studio first**. If it hits a quota limit or times out (90s), it automatically falls back to OpenRouter. You can set both keys so you never get stuck.
 
 ### Setup
 
@@ -49,7 +53,7 @@ git checkout taiwan-stock
 npm install
 
 cp .env.example .env
-# Edit .env — set OPENROUTER_API_KEY at minimum
+# Edit .env — set at least GOOGLE_AI_STUDIO_API_KEY or OPENROUTER_API_KEY
 ```
 
 ### Run
@@ -204,11 +208,14 @@ Additional adjustments: quotes per subsection 5→2, CEO interview URLs 25→5, 
 
 MIT License — use, modify, distribute, and commercialize freely, provided copyright and license notices are preserved.
 
+Original work © 2026 Roger Chen ([Equityautoresearch](https://github.com/bear0103papa/Equityautoresearch))
+Taiwan-market fork © 2026 jasanlin177
+
 ---
 
 ## Credits
 
-- **Original project**: [Roger's Letter — Equityautoresearch](https://github.com/bear0103papa/Equityautoresearch)
+- **Original project**: [Roger's Letter — Equityautoresearch](https://github.com/bear0103papa/Equityautoresearch) — 本專案的根基，感謝 Roger 無私開源
 - **Framework inspiration**: [Andrej Karpathy's autoresearch](https://github.com/karpathy/autoresearch)
 - **Scoring framework**: Zhang Lei (Hillhouse Capital) four-dimension investment philosophy
 
@@ -254,8 +261,12 @@ Roger 將投資研究自動化工具開源分享，以 Andrej Karpathy 的 autor
 ### 環境需求
 
 - Node.js 18+
-- OpenRouter API Key（必要，預設使用 `google/gemini-3.1-pro-preview`）
+- 以下 API Key 至少填一個（建議兩個都填）：
+  - **Google AI Studio API Key**（免費，優先使用）— 申請：https://aistudio.google.com
+  - **OpenRouter API Key**（按 token 計費，備援）— 申請：https://openrouter.ai
 - 選填：Brave Search API Key（提升搜尋品質）
+
+系統會**優先呼叫 Google AI Studio**（免費）；若遇到額度超限或逾時（90 秒），自動切換至 OpenRouter。兩個 Key 都設定，研究就不會因額度問題中斷。
 
 ### 安裝
 
@@ -267,7 +278,7 @@ git checkout taiwan-stock
 npm install
 
 cp .env.example .env
-# 編輯 .env，至少填入 OPENROUTER_API_KEY
+# 編輯 .env，至少填入 GOOGLE_AI_STUDIO_API_KEY 或 OPENROUTER_API_KEY
 ```
 
 ### 執行研究
@@ -421,6 +432,9 @@ results/
 ## 授權
 
 MIT License — 可自由使用、修改、散布與商用，惟須保留版權聲明。
+
+原始著作權 © 2026 Roger Chen（[Equityautoresearch](https://github.com/bear0103papa/Equityautoresearch)）
+台股分支著作權 © 2026 jasanlin177
 
 ---
 
