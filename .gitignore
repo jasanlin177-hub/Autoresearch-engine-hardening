@@ -3,3 +3,4 @@ node_modules/
 results/*.tsv
 data/companies/*/
 !data/companies/.gitkeep
+__pycache__/

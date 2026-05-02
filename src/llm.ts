@@ -33,11 +33,13 @@ const GOOGLE_TIMEOUT_MS = 90_000;
 
 // ── Free OpenRouter models to try before paid quota ──
 // Tried in order; skip to next on 429/402/timeout.
+// Last verified: 2026-05-02 (all 4 previous models removed from OpenRouter)
 const FREE_MODELS: string[] = [
-  'google/gemini-2.5-pro-exp-03-25:free',
-  'google/gemini-2.0-flash-exp:free',
-  'meta-llama/llama-4-maverick:free',
-  'deepseek/deepseek-r1:free',
+  'google/gemma-4-31b-it:free',            // Google Gemma 4 31B, 262k ctx, good Chinese
+  'nvidia/nemotron-3-super-120b-a12b:free', // 120B MoE, 262k ctx
+  'meta-llama/llama-3.3-70b-instruct:free', // 70B, 65k ctx, reliable
+  'openai/gpt-oss-120b:free',               // OpenAI open-source 120B, 131k ctx
+  'nousresearch/hermes-3-llama-3.1-405b:free', // 405B, 131k ctx, last resort free
 ];
 
 if (!GOOGLE_STUDIO_KEY && !OPENROUTER_KEY) {
@@ -233,7 +235,7 @@ export async function chat(
     console.warn('  [llm] All free models exhausted → trying paid OpenRouter');
   }
 
-  // ── Last resort: OpenRouter 付費模型 ──
+  // ── Last resort: OpenRouter 付費模型（降級為 Flash 以節省費用）──
   if (!OPENROUTER_KEY) {
     throw new Error(
       '[llm] All providers failed and OPENROUTER_API_KEY is not set. ' +
@@ -241,11 +243,23 @@ export async function chat(
     );
   }
 
+  // If the requested model is a heavy Pro model, downgrade to Flash for paid tier
+  // to avoid burning budget. Pro quality is only cost-justified via free Google Studio quota.
+  const PAID_DOWNGRADE: Record<string, string> = {
+    'google/gemini-3.1-pro-preview':  'google/gemini-2.5-flash-preview-05-20',
+    'google/gemini-2.5-pro-preview':  'google/gemini-2.5-flash-preview-05-20',
+    'google/gemini-3.1-flash-preview': 'google/gemini-2.0-flash',
+  };
+  const paidModel = PAID_DOWNGRADE[requestedModel] ?? requestedModel;
+  if (paidModel !== requestedModel) {
+    console.warn(`  [llm] Downgrading ${requestedModel} → ${paidModel} for paid tier (cost control)`);
+  }
+
   const result = await callEndpoint(
-    OPENROUTER_URL, OPENROUTER_KEY, requestedModel,
+    OPENROUTER_URL, OPENROUTER_KEY, paidModel,
     messages, opts,
   );
-  console.log(`  [llm] OpenRouter paid (${requestedModel}) ✓`);
+  console.log(`  [llm] OpenRouter paid (${paidModel}) ✓`);
   return { ...result, provider: 'openrouter' };
 }
 
