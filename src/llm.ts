@@ -31,6 +31,15 @@ const GOOGLE_STUDIO_URL = 'https://generativelanguage.googleapis.com/v1beta/open
 // ── timeout for Google AI Studio before falling back (ms) ──
 const GOOGLE_TIMEOUT_MS = 90_000;
 
+// ── Free OpenRouter models to try before paid quota ──
+// Tried in order; skip to next on 429/402/timeout.
+const FREE_MODELS: string[] = [
+  'google/gemini-2.5-pro-exp-03-25:free',
+  'google/gemini-2.0-flash-exp:free',
+  'meta-llama/llama-4-maverick:free',
+  'deepseek/deepseek-r1:free',
+];
+
 if (!GOOGLE_STUDIO_KEY && !OPENROUTER_KEY) {
   console.error(
     '[llm] No API key found.\n' +
@@ -198,11 +207,37 @@ export async function chat(
     }
   }
 
-  // ── Fallback: OpenRouter ──
+  // ── Fallback: OpenRouter 免費模型（無需餘額）──
+  if (OPENROUTER_KEY) {
+    for (const freeModel of FREE_MODELS) {
+      try {
+        const result = await callEndpoint(
+          OPENROUTER_URL, OPENROUTER_KEY, freeModel,
+          messages, opts, 120_000,
+        );
+        console.log(`  [llm] OpenRouter free (${freeModel}) ✓`);
+        return { ...result, provider: 'openrouter' };
+      } catch (err: any) {
+        const msg: string = err.message ?? '';
+        const isQuota = msg.includes('402') || msg.includes('429') ||
+                        msg.toLowerCase().includes('quota') ||
+                        msg.toLowerCase().includes('rate') ||
+                        msg.toLowerCase().includes('credits');
+        if (isQuota) {
+          console.warn(`  [llm] OpenRouter free model ${freeModel} unavailable → trying next`);
+        } else {
+          console.warn(`  [llm] OpenRouter free model ${freeModel} error: ${msg.slice(0, 80)} → trying next`);
+        }
+      }
+    }
+    console.warn('  [llm] All free models exhausted → trying paid OpenRouter');
+  }
+
+  // ── Last resort: OpenRouter 付費模型 ──
   if (!OPENROUTER_KEY) {
     throw new Error(
-      '[llm] Google AI Studio failed and OPENROUTER_API_KEY is not set. ' +
-      'Add it to .env to enable fallback.',
+      '[llm] All providers failed and OPENROUTER_API_KEY is not set. ' +
+      'Add GOOGLE_AI_STUDIO_API_KEY or OPENROUTER_API_KEY to .env.',
     );
   }
 
@@ -210,7 +245,7 @@ export async function chat(
     OPENROUTER_URL, OPENROUTER_KEY, requestedModel,
     messages, opts,
   );
-  console.log(`  [llm] OpenRouter (${requestedModel}) ✓`);
+  console.log(`  [llm] OpenRouter paid (${requestedModel}) ✓`);
   return { ...result, provider: 'openrouter' };
 }
 
