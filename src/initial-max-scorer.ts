@@ -493,9 +493,18 @@ export async function scoreCompanyResearch(
       round,
     };
   } else {
-    // Try LLM scorer
-    console.log(`[scorer] Running LLM scorer (${model}) for ${ticker}...`);
-    const llmResult = await llmScore(ticker, reportContent, model);
+    // ── #4 補強：LLM 失敗改重試（最多 2 次），不降級至 heuristic ──
+    const LLM_MAX_RETRIES = 2;
+    let llmResult = null;
+    for (let attempt = 1; attempt <= LLM_MAX_RETRIES; attempt++) {
+      console.log(`[scorer] Running LLM scorer (${model}) for ${ticker}... (attempt ${attempt}/${LLM_MAX_RETRIES})`);
+      llmResult = await llmScore(ticker, reportContent, model);
+      if (llmResult) break;
+      if (attempt < LLM_MAX_RETRIES) {
+        console.warn(`[scorer] LLM attempt ${attempt} failed, retrying in 5s...`);
+        await new Promise(r => setTimeout(r, 5_000));
+      }
+    }
 
     if (llmResult) {
       score = { ...llmResult, round };
@@ -509,10 +518,17 @@ export async function scoreCompanyResearch(
       }
       console.log(`[scorer] LLM score: ${score.total}/100 (環境:${score.環境.score} 生意:${score.生意.score} 組織:${score.組織.score} 人:${score.人.score})`);
     } else {
-      // Heuristic fallback
-      console.log('[scorer] LLM failed, using heuristic fallback');
-      score = { ...heuristicScore(ticker), round };
-      console.log(`[scorer] Heuristic score: ${score.total}/100`);
+      // ── #4 補強：兩次重試皆失敗 → 回傳零分並標記，不用 heuristic 干擾 plateau 判斷 ──
+      console.error('[scorer] LLM scorer failed after all retries. Returning zero score to avoid heuristic noise.');
+      score = {
+        環境: { score: 0, max: 20, gaps: ['LLM scorer 失敗（已重試 2 次），本輪分數不計入 plateau 判斷'] },
+        生意: { score: 0, max: 35, gaps: ['LLM scorer 失敗'] },
+        組織: { score: 0, max: 20, gaps: ['LLM scorer 失敗'] },
+        人: { score: 0, max: 25, gaps: ['LLM scorer 失敗'] },
+        total: -1, // ← 負值作為「本輪評分無效」的旗標，runner 端判斷
+        passThreshold: false,
+        round,
+      };
     }
   }
 

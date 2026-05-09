@@ -1059,10 +1059,22 @@ async function main() {
     return;
   }
 
+  // ── #4 補強：plateau 判斷改為 3 輪 + rolling average 平滑噪音 ──
+  const PLATEAU_ROUNDS = 3;       // 連續幾輪無顯著提升才停止
+  const PLATEAU_MIN_DELTA = 2;    // 小於此分數視為「無顯著提升」
+
+  /** 取最近 N 筆有效分數（排除 LLM 失敗的 -1）的平均，供 plateau 比較用 */
+  function rollingAvg(scores: number[], n = 3): number {
+    const valid = scores.filter(s => s >= 0).slice(-n);
+    if (valid.length === 0) return 0;
+    return valid.reduce((a, b) => a + b, 0) / valid.length;
+  }
+
   // Main loop
   const history: RoundResult[] = [baselineResult];
   let prevScore = baselineScore.total;
   let plateauCount = 0;
+  const scoreHistory: number[] = [baselineScore.total]; // 用於 rolling avg
 
   for (let round = 1; round <= maxRounds; round++) {
     console.log(`\n═══ Round ${round}/${maxRounds} (current: ${prevScore}/100) ═══`);
@@ -1093,8 +1105,23 @@ async function main() {
       // Score new state
       console.log('Scoring...');
       const { score: newScore } = await scoreCompanyResearch(ticker, round, model);
+
+      // ── #4 補強：LLM scorer 失敗（total = -1）→ 跳過本輪 plateau 判斷，不更新 prevScore ──
+      if (newScore.total < 0) {
+        console.warn(`⚠ Round ${round}: LLM scorer returned invalid score, skipping plateau check.`);
+        const commitMsg = `initial-max r${round}: ${description.slice(0, 60)} — score N/A (scorer failed)`;
+        const commitHash = gitCommit(commitMsg);
+        history.push({ round, commit: commitHash, score: prevScore, status: 'no_improvement', description, timestamp: new Date().toISOString() });
+        appendTsv(tsvPath, history[history.length - 1]!);
+        continue;
+      }
+
+      const prevAvg = rollingAvg(scoreHistory);
+      scoreHistory.push(newScore.total);
+      const newAvg = rollingAvg(scoreHistory);
       const delta = newScore.total - prevScore;
-      console.log(`Score: ${newScore.total}/100 (${delta >= 0 ? '+' : ''}${delta} from ${prevScore})`);
+      const avgDelta = newAvg - prevAvg;
+      console.log(`Score: ${newScore.total}/100 (raw Δ${delta >= 0 ? '+' : ''}${delta} | rolling avg ${prevAvg.toFixed(1)}→${newAvg.toFixed(1)}, avgΔ${avgDelta >= 0 ? '+' : ''}${avgDelta.toFixed(1)})`);
 
       // Commit (always — research is additive)
       const commitMsg = `initial-max r${round}: ${description.slice(0, 60)} — score ${newScore.total}/100`;
@@ -1108,11 +1135,12 @@ async function main() {
       history.push(result);
       appendTsv(tsvPath, result);
 
-      if (delta > 0) {
-        console.log(`✓ IMPROVED by +${delta}`);
+      // ── #4 補強：plateau 以 rolling avg delta < PLATEAU_MIN_DELTA 判斷，連續 PLATEAU_ROUNDS 輪才停 ──
+      if (avgDelta >= PLATEAU_MIN_DELTA) {
+        console.log(`✓ IMPROVED (avg Δ+${avgDelta.toFixed(1)})`);
         plateauCount = 0;
       } else {
-        console.log(`→ No improvement (plateau count: ${plateauCount + 1}/2)`);
+        console.log(`→ Low avg improvement (avgΔ${avgDelta.toFixed(1)} < ${PLATEAU_MIN_DELTA}) — plateau count: ${plateauCount + 1}/${PLATEAU_ROUNDS}`);
         plateauCount++;
       }
 
@@ -1123,8 +1151,8 @@ async function main() {
         console.log(`\n✓ TARGET REACHED: ${newScore.total}/100 ≥ ${PASS_THRESHOLD}`);
         break;
       }
-      if (plateauCount >= 2) {
-        console.log(`\n⚠ PLATEAU DETECTED: 2 consecutive rounds with no improvement. Stopping.`);
+      if (plateauCount >= PLATEAU_ROUNDS) {
+        console.log(`\n⚠ PLATEAU DETECTED: ${PLATEAU_ROUNDS} consecutive rounds with avg improvement < ${PLATEAU_MIN_DELTA}pts. Stopping.`);
         break;
       }
 
@@ -1148,6 +1176,14 @@ async function main() {
 
   if (!skipPolish && fs.existsSync(mainFilePath) && ranAtLeastOneResearchRound) {
     console.log('\n═══ Polish pass（主檔順稿／格式整理，無新研究）═══');
+    // ── #3 補強：記錄 polish 前分數，事後比較；退步則回復 .bak ──
+    const scoreBeforePolish = prevScore;
+    const bakPath = mainFilePath + '.bak';
+    // 確保 .bak 是 polish 前的快照（writeResearchSection 已會建立，這裡補保險）
+    if (!fs.existsSync(bakPath)) {
+      fs.copyFileSync(mainFilePath, bakPath);
+      console.log(`  [polish] 備份快照已存至 ${ticker}_Initial_MAX.md.bak`);
+    }
     try {
       const polishGaps: InitialMaxGaps = { round: polishRoundId, score: prevScore, gaps: [] };
       const polishResp = await runGapFillAgent(
@@ -1168,18 +1204,38 @@ async function main() {
       console.log(`Polish summary: ${polishDesc}`);
       console.log('Scoring after polish...');
       const { score: afterPolish } = await scoreCompanyResearch(ticker, polishRoundId, model);
-      console.log(`Score after polish: ${afterPolish.total}/100`);
-      const commitHash = gitCommit(`initial-max polish: ${polishDesc.slice(0, 55)} — score ${afterPolish.total}/100`);
-      history.push({
-        round: polishRoundId,
-        commit: commitHash,
-        score: afterPolish.total,
-        status: 'keep',
-        description: polishDesc,
-        timestamp: new Date().toISOString(),
-      });
-      appendTsv(tsvPath, history[history.length - 1]!);
-      prevScore = afterPolish.total;
+      console.log(`Score after polish: ${afterPolish.total}/100 (before: ${scoreBeforePolish}/100)`);
+
+      // ── #3 補強：polish 後分數 < polish 前 → 回復 .bak，拒絕這次 polish ──
+      if (afterPolish.total < scoreBeforePolish) {
+        console.warn(`⚠ Polish REJECTED: score dropped ${scoreBeforePolish} → ${afterPolish.total}. Restoring from .bak...`);
+        if (fs.existsSync(bakPath)) {
+          fs.copyFileSync(bakPath, mainFilePath);
+          console.log(`  ✓ 已從 .bak 回復主檔，polish 結果丟棄。`);
+        }
+        history.push({
+          round: polishRoundId,
+          commit: gitShortHash(),
+          score: scoreBeforePolish,
+          status: 'no_improvement',
+          description: `polish rejected (score dropped ${scoreBeforePolish}→${afterPolish.total})`,
+          timestamp: new Date().toISOString(),
+        });
+        appendTsv(tsvPath, history[history.length - 1]!);
+      } else {
+        const commitHash = gitCommit(`initial-max polish: ${polishDesc.slice(0, 55)} — score ${afterPolish.total}/100`);
+        history.push({
+          round: polishRoundId,
+          commit: commitHash,
+          score: afterPolish.total,
+          status: 'keep',
+          description: polishDesc,
+          timestamp: new Date().toISOString(),
+        });
+        appendTsv(tsvPath, history[history.length - 1]!);
+        prevScore = afterPolish.total;
+        console.log(`✓ Polish accepted: ${scoreBeforePolish} → ${afterPolish.total}`);
+      }
     } catch (err: any) {
       console.error(`Polish pass CRASH: ${err.message}`);
       const crashResult: RoundResult = {
