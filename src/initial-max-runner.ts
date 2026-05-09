@@ -169,15 +169,70 @@ async function webSearch(query: string, count = 5): Promise<string> {
   }
 }
 
+/** fetch_url 最大等待時間（秒） */
+const FETCH_TIMEOUT_MS = 15_000;
+
+/** PDF URL 或 Content-Type 偵測用的 patterns */
+const PDF_URL_PATTERNS = /\.pdf(\?|#|$)/i;
+const PDF_CONTENT_TYPES = /application\/(pdf|octet-stream)/i;
+
 async function fetchUrl(url: string): Promise<string> {
+  // ── #1 補強：PDF URL 偵測（不嘗試下載，直接跳過）──
+  if (PDF_URL_PATTERNS.test(url)) {
+    console.log(`  [fetch] SKIP PDF URL: ${url.slice(0, 80)}`);
+    return JSON.stringify({
+      error: 'PDF URL 已跳過（下載 PDF 會永久卡死）。請改用 fetch_transcript 或 SEC XBRL。',
+      url,
+      skipped_reason: 'pdf_url',
+    });
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
   try {
+    // HEAD 預檢：確認 Content-Type 不是 PDF
+    try {
+      const headRes = await fetch(url, {
+        method: 'HEAD',
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/115.0' },
+        signal: controller.signal,
+      });
+      const ct = headRes.headers.get('content-type') ?? '';
+      if (PDF_CONTENT_TYPES.test(ct)) {
+        clearTimeout(timer);
+        console.log(`  [fetch] SKIP PDF Content-Type (${ct}): ${url.slice(0, 80)}`);
+        return JSON.stringify({
+          error: `Content-Type "${ct}" 為 PDF，已跳過。請改用 fetch_transcript 或 SEC XBRL。`,
+          url,
+          skipped_reason: 'pdf_content_type',
+        });
+      }
+    } catch {
+      // HEAD 失敗不影響 GET，繼續
+    }
+
     const res = await fetch(url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/115.0',
         Accept: 'text/html,text/plain',
       },
+      signal: controller.signal,
     });
+    clearTimeout(timer);
+
     if (!res.ok) return JSON.stringify({ error: `HTTP ${res.status}` });
+
+    // GET 回應的 Content-Type 二次確認
+    const ct = res.headers.get('content-type') ?? '';
+    if (PDF_CONTENT_TYPES.test(ct)) {
+      return JSON.stringify({
+        error: `回應 Content-Type "${ct}" 為 PDF，已跳過。請改用 fetch_transcript 或 SEC XBRL。`,
+        url,
+        skipped_reason: 'pdf_content_type',
+      });
+    }
+
     const text = await res.text();
     // Strip most HTML tags, keep text content
     const stripped = text
@@ -190,6 +245,16 @@ async function fetchUrl(url: string): Promise<string> {
       .slice(0, 12000);
     return JSON.stringify({ url, content: stripped });
   } catch (err: any) {
+    clearTimeout(timer);
+    // ── #1 補強：timeout 明確回報 ──
+    if (err.name === 'AbortError') {
+      console.log(`  [fetch] TIMEOUT (${FETCH_TIMEOUT_MS / 1000}s): ${url.slice(0, 80)}`);
+      return JSON.stringify({
+        error: `fetch_url 超時（${FETCH_TIMEOUT_MS / 1000}s）— 此 URL 回應過慢或檔案過大，已跳過。`,
+        url,
+        skipped_reason: 'timeout',
+      });
+    }
     return JSON.stringify({ error: err.message });
   }
 }
@@ -267,6 +332,28 @@ function writeResearchSection(
   }
 
   const fullPath = path.join(dir, filename);
+
+  // ── #2 補強：overwrite 前自動備份 ──
+  const isMainFile = filename.endsWith('_Initial_MAX.md');
+  if (mode === 'overwrite' && isMainFile && fs.existsSync(fullPath)) {
+    const bakPath = fullPath + '.bak';
+    fs.copyFileSync(fullPath, bakPath);
+    console.log(`  [write] 備份已存至 ${filename}.bak`);
+  }
+
+  // ── #2 補強：最小字數驗證（防止佔位符覆蓋真實內容）──
+  if (isMainFile && fs.existsSync(fullPath)) {
+    const existingChars = fs.readFileSync(fullPath, 'utf-8').length;
+    if (existingChars > 500 && content.length < existingChars * 0.5) {
+      console.warn(`  [write] REJECTED — 新內容 ${content.length} 字元 < 現有 ${existingChars} 字元的 50%，疑似佔位符，拒絕寫入。`);
+      return JSON.stringify({
+        error: `寫入被拒絕：新內容（${content.length} 字元）不足現有檔案（${existingChars} 字元）的 50%，疑似為摘要或佔位符。請用 replace_section 逐節修正，或確認 content 為完整全文後再用 overwrite。`,
+        existing_chars: existingChars,
+        new_chars: content.length,
+      });
+    }
+  }
+
   if (mode === 'overwrite') {
     fs.writeFileSync(fullPath, content);
     return JSON.stringify({ status: 'written', file: `data/companies/${ticker}/${filename}`, chars: content.length });
