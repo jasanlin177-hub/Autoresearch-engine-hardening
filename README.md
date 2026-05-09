@@ -54,17 +54,20 @@ cp .env.example .env   # 若無範本可手動建立
 `.env` 內容：
 
 ```env
-# 主要（必填其一）
+# ── 第一層：Google AI Studio（免費 Gemini Pro 額度，優先使用）──
+GOOGLE_AI_STUDIO_API_KEY=AIza...        # https://aistudio.google.com/apikey
+
+# ── 第二 + 三層：OpenRouter（必填其一；免費模型 + 付費 Flash 共用同一把 key）──
 OPENROUTER_API_KEY=sk-or-v1-...         # https://openrouter.ai
 
-# 搜尋（建議設定）
+# ── 搜尋（建議設定）──
 BRAVE_SEARCH_API_KEY=...                # https://brave.com/search/api/
 
-# 備用財報（可選，Premium 功能受限）
+# ── 備用財報（可選，Premium 功能受限）──
 NINJA_API_KEY=...                       # https://api-ninjas.com
 ```
 
-> `OPENROUTER_API_KEY` 為必填。`BRAVE_SEARCH_API_KEY` 不設定時自動 fallback 至 DuckDuckGo Lite。`NINJA_API_KEY` 可不填，財報資料改由 `fetch_sec_xbrl` 直取。
+> **`GOOGLE_AI_STUDIO_API_KEY` 和 `OPENROUTER_API_KEY` 至少填一個。** 建議兩個都設定——Google Studio 走免費額度；OpenRouter 免費模型額度耗盡後，自動降級為 **Gemini Flash 付費層**，使用的仍是同一把 `OPENROUTER_API_KEY`（OpenRouter 帳戶需有餘額），不需另外一把 key。`BRAVE_SEARCH_API_KEY` 不設定時自動 fallback 至 DuckDuckGo Lite。`NINJA_API_KEY` 可不填，財報資料改由 `fetch_sec_xbrl` 直取。
 
 ---
 
