@@ -52,8 +52,12 @@ function parseArgs() {
     const arg = process.argv[i];
     if (arg.startsWith('--')) {
       const key = arg.slice(2);
-      const val = process.argv[i + 1] && !process.argv[i + 1].startsWith('--') ? process.argv[++i] : 'true';
-      args[key] = val;
+      // ── #7 補強：--why 等多字參數正確解析（收集所有非 -- 開頭的 token）──
+      const vals: string[] = [];
+      while (process.argv[i + 1] && !process.argv[i + 1].startsWith('--')) {
+        vals.push(process.argv[++i]);
+      }
+      args[key] = vals.length > 0 ? vals.join(' ') : 'true';
     }
   }
   return args;
@@ -63,6 +67,23 @@ function parseArgs() {
 
 function exec(cmd: string): string {
   return execSync(cmd, { cwd: PROJECT_ROOT, encoding: 'utf-8', timeout: 60_000 }).trim();
+}
+
+/** ── #6 補強：Runner 啟動時確保 git repo 存在，若無則自動 init + 初始 commit ── */
+function ensureGitRepo(): void {
+  try {
+    exec('git rev-parse --git-dir');
+  } catch {
+    console.log('[git] Not a git repository. Auto-initializing...');
+    exec('git init');
+    try {
+      exec('git add -A');
+      exec('git commit -m "chore: auto-init by initial-max-runner"');
+      console.log('[git] ✓ Git repo initialized with initial commit.');
+    } catch {
+      console.log('[git] ✓ Git repo initialized (no files to commit yet).');
+    }
+  }
 }
 
 function gitShortHash(): string {
@@ -285,13 +306,64 @@ function findSectionRange(lines: string[], sectionAnchor: string): [number, numb
   return [sectionStart, sectionEnd];
 }
 
-/** 將 content 插入 section_anchor 對應小節的結尾（下一小節之前）。 */
+/** ── #5 補強：寫入後清理重複 heading（同一 ## X.Y 出現 2 次以上 → 保留最後一次）── */
+function deduplicateSections(fullPath: string): void {
+  const raw = fs.readFileSync(fullPath, 'utf-8');
+  const lines = raw.split(/\r?\n/);
+
+  // 找出所有 ## / ### 數字錨點 heading 的出現位置
+  const headingPositions = new Map<string, number[]>();
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(/^(#{2,3})\s+(\d+\.\d+)\b/);
+    if (m) {
+      const key = m[2]; // e.g. "1.1", "2.3"
+      if (!headingPositions.has(key)) headingPositions.set(key, []);
+      headingPositions.get(key)!.push(i);
+    }
+  }
+
+  // 若有重複，刪除較早的整節（保留最後一次）
+  let changed = false;
+  const linesToRemove = new Set<number>();
+  for (const [key, positions] of headingPositions) {
+    if (positions.length <= 1) continue;
+    console.warn(`  [dedup] Found ${positions.length} occurrences of heading "${key}", keeping last.`);
+    // 刪除除最後一次以外的所有節
+    for (let p = 0; p < positions.length - 1; p++) {
+      const start = positions[p];
+      // 找到這一節的結束（下一個 heading 之前）
+      let end = lines.length;
+      for (let j = start + 1; j < lines.length; j++) {
+        if (/^#{2,3}\s+/.test(lines[j])) { end = j; break; }
+      }
+      for (let j = start; j < end; j++) linesToRemove.add(j);
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    const cleaned = lines.filter((_, i) => !linesToRemove.has(i)).join('\n');
+    fs.writeFileSync(fullPath, cleaned);
+  }
+}
+
+/** 將 content 插入 section_anchor 對應小節的結尾（下一小節之前）。
+ *  ── #5 補強：若該 anchor 已有實質內容（>80字元），自動升級為 replaceSection 避免重複堆疊 ── */
 function insertIntoSection(fullPath: string, sectionAnchor: string, content: string): boolean {
   const raw = fs.readFileSync(fullPath, 'utf-8');
   const lines = raw.split(/\r?\n/);
   const range = findSectionRange(lines, sectionAnchor);
   if (!range) return false;
-  const [, insertBefore] = range;
+  const [sectionStart, insertBefore] = range;
+
+  // 檢查該節現有內容是否已有實質文字
+  const existingBody = lines.slice(sectionStart + 1, insertBefore).join('\n').trim();
+  if (existingBody.length > 80) {
+    // 已有內容 → 強制改用 replaceSection，防止重複堆疊
+    console.log(`  [dedup] anchor "${sectionAnchor}" already has content (${existingBody.length} chars), upgrading insert→replace.`);
+    return replaceSection(fullPath, sectionAnchor, content);
+  }
+
   const newBlock = content.trim();
   const before = lines.slice(0, insertBefore).join('\n').trimEnd();
   const after = lines.slice(insertBefore).join('\n');
@@ -368,12 +440,14 @@ function writeResearchSection(
       if (!ok) {
         return JSON.stringify({ error: `section_anchor "${sectionAnchor}" not found; use insert_into_section or overwrite` });
       }
+      if (isMainFile) deduplicateSections(fullPath); // ── #5 補強
       return JSON.stringify({ status: 'replaced_section', file: `data/companies/${ticker}/${filename}`, section_anchor: sectionAnchor, chars: content.length });
     }
     const ok = insertIntoSection(fullPath, sectionAnchor, content);
     if (!ok) {
       return JSON.stringify({ error: `section_anchor "${sectionAnchor}" not found in file; use append or overwrite` });
     }
+    if (isMainFile) deduplicateSections(fullPath); // ── #5 補強
     return JSON.stringify({ status: 'inserted_into_section', file: `data/companies/${ticker}/${filename}`, section_anchor: sectionAnchor, chars: content.length });
   }
   const existing = fs.existsSync(fullPath) ? fs.readFileSync(fullPath, 'utf-8') : '';
@@ -1002,6 +1076,9 @@ async function main() {
   const model = args.model ?? DEFAULT_MODEL;
   const investorNote = args.why ?? args.note ?? '';
   const tag = args.tag ?? new Date().toISOString().slice(5, 10).replace('-', '');
+
+  // ── #6 補強：確保 git repo 存在（防止 "not a git repository" 錯誤）──
+  ensureGitRepo();
 
   console.log('╔══════════════════════════════════════╗');
   console.log('║       Initial MAX Runner             ║');
