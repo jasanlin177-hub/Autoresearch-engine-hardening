@@ -596,6 +596,182 @@ async function callNinjaApi(action: string, args: Record<string, unknown>): Prom
   }
 }
 
+// ── #9 補強：結構化財務直取工具 ──
+
+/**
+ * 從 stockanalysis.com 抓取 earnings call 逐字稿 HTML。
+ * URL: https://stockanalysis.com/stocks/{ticker}/transcripts/q{quarter}-{year}/
+ */
+async function fetchTranscript(ticker: string, year: number, quarter: number): Promise<string> {
+  const sym = cleanTicker(ticker);
+  const url = `https://stockanalysis.com/stocks/${sym.toLowerCase()}/transcripts/q${quarter}-${year}/`;
+  console.log(`  [transcript] fetching ${url}`);
+
+  const raw = await fetchUrl(url);
+  let parsed: Record<string, unknown>;
+  try { parsed = JSON.parse(raw); } catch { parsed = {}; }
+
+  // fetchUrl 已回傳 error（PDF / timeout / HTTP error）
+  if (parsed.error) {
+    return JSON.stringify({ error: parsed.error, ticker: sym, year, quarter, url });
+  }
+
+  const content = String(parsed.content ?? '');
+  if (content.length < 200) {
+    return JSON.stringify({
+      error: `逐字稿內容過短（${content.length} 字元），可能頁面不存在或需登入。`,
+      ticker: sym, year, quarter, url,
+    });
+  }
+
+  const truncated = content.slice(0, 25_000);
+  return JSON.stringify({
+    ticker: sym, year, quarter, url,
+    content: truncated,
+    chars: truncated.length,
+    total_chars: content.length,
+    ...(content.length > 25_000 ? { note: `僅前 25000 字元，全文共 ${content.length} 字元` } : {}),
+  });
+}
+
+/**
+ * SEC EDGAR XBRL API 取結構化財務 JSON（絕不是 PDF）。
+ * 若提供 cik → 直接查 companyfacts；否則先搜尋 CIK。
+ * 回傳 Revenues / NetIncomeLoss / OperatingIncomeLoss / Assets / StockholdersEquity / EarningsPerShareBasic 近 8 年 10-K 數據。
+ */
+async function fetchSecXbrl(ticker: string, cik?: string): Promise<string> {
+  const sym = cleanTicker(ticker);
+  const CONCEPTS = [
+    'Revenues', 'RevenueFromContractWithCustomerExcludingAssessedTax',
+    'NetIncomeLoss', 'OperatingIncomeLoss',
+    'Assets', 'StockholdersEquity', 'EarningsPerShareBasic',
+  ];
+
+  // Step 1: resolve CIK
+  let resolvedCik = cik ? String(cik).replace(/\D/g, '').padStart(10, '0') : '';
+  if (!resolvedCik) {
+    try {
+      const searchUrl = `https://efts.sec.gov/LATEST/search-index?q=%22${encodeURIComponent(sym)}%22&dateRange=custom&startdt=2020-01-01&forms=10-K`;
+      const res = await fetch(searchUrl, {
+        headers: { 'User-Agent': 'AutoResearch/1.0 jasanlin177@gmail.com', Accept: 'application/json' },
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (res.ok) {
+        const data = await res.json() as any;
+        const hit = data?.hits?.hits?.[0]?._source;
+        if (hit?.entity_id) resolvedCik = String(hit.entity_id).padStart(10, '0');
+      }
+    } catch {}
+  }
+
+  if (!resolvedCik) {
+    // fallback: company_tickers.json
+    try {
+      const res = await fetch('https://www.sec.gov/files/company_tickers.json', {
+        headers: { 'User-Agent': 'AutoResearch/1.0 jasanlin177@gmail.com' },
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (res.ok) {
+        const data = await res.json() as any;
+        for (const v of Object.values(data) as any[]) {
+          if ((v.ticker ?? '').toUpperCase() === sym) {
+            resolvedCik = String(v.cik_str).padStart(10, '0');
+            break;
+          }
+        }
+      }
+    } catch {}
+  }
+
+  if (!resolvedCik) {
+    return JSON.stringify({ error: `找不到 ${sym} 的 SEC CIK，請手動提供 cik 參數。`, ticker: sym });
+  }
+
+  // Step 2: fetch companyfacts
+  const factsUrl = `https://data.sec.gov/api/xbrl/companyfacts/CIK${resolvedCik}.json`;
+  console.log(`  [sec_xbrl] fetching ${factsUrl}`);
+  let factsData: any;
+  try {
+    const res = await fetch(factsUrl, {
+      headers: { 'User-Agent': 'AutoResearch/1.0 jasanlin177@gmail.com', Accept: 'application/json' },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) return JSON.stringify({ error: `SEC EDGAR HTTP ${res.status}`, ticker: sym, cik: resolvedCik });
+    factsData = await res.json();
+  } catch (e: any) {
+    return JSON.stringify({ error: e?.message ?? 'fetch failed', ticker: sym, cik: resolvedCik });
+  }
+
+  const usGaap = factsData?.facts?.['us-gaap'] ?? {};
+  const summary: Record<string, { unit: string; annual: { year: number; val: number; filed: string }[] }> = {};
+
+  for (const concept of CONCEPTS) {
+    if (!usGaap[concept]) continue;
+    const units = usGaap[concept].units ?? {};
+    const unitKey = Object.keys(units)[0]; // USD, shares, USD/shares
+    if (!unitKey) continue;
+    const rows: any[] = units[unitKey] ?? [];
+    // 只要 form=10-K，取 frame 或 fy 標記的 annual 數據
+    const annual = rows
+      .filter((r: any) => r.form === '10-K' && r.fp === 'FY' && r.val != null)
+      .sort((a: any, b: any) => b.fy - a.fy)
+      .slice(0, 8)
+      .map((r: any) => ({ year: r.fy, val: r.val, filed: r.filed ?? '' }));
+    if (annual.length > 0) summary[concept] = { unit: unitKey, annual };
+  }
+
+  const out = JSON.stringify({ ticker: sym, cik: resolvedCik, source: factsUrl, financials: summary }, null, 2);
+  return out.length > 8_000 ? out.slice(0, 8_000) + '\n...(截斷)' : out;
+}
+
+/**
+ * 搜尋並抓取公司 IR 頁面的 earnings press release HTML（自動避開 PDF）。
+ * 先用 webSearch 找到最相關的新聞稿 URL，再 fetchUrl 抓取全文。
+ */
+async function fetchIrPressRelease(ticker: string, year: number, quarter: number): Promise<string> {
+  const sym = cleanTicker(ticker);
+  const query = `${sym} Q${quarter} ${year} earnings press release investor relations`;
+  console.log(`  [ir_pr] searching: ${query}`);
+
+  const searchRaw = await webSearch(query, 5);
+  let results: { title: string; url: string; description: string }[] = [];
+  try {
+    const parsed = JSON.parse(searchRaw);
+    results = parsed.results ?? [];
+  } catch {}
+
+  // 優先選含 ir. / investor / press-release 的結果，排除 PDF
+  const candidates = results.filter(
+    (r) => !PDF_URL_PATTERNS.test(r.url) &&
+      (r.url.includes('ir.') || r.url.includes('investor') || r.url.includes('press-release') || r.url.includes('newsroom')),
+  );
+  const target = (candidates[0] ?? results[0]);
+  if (!target) {
+    return JSON.stringify({ error: '找不到 IR press release 搜尋結果', ticker: sym, year, quarter });
+  }
+  if (PDF_URL_PATTERNS.test(target.url)) {
+    return JSON.stringify({ error: 'IR press release URL 為 PDF，已跳過。請用 fetch_sec_xbrl 取結構化財務數據。', ticker: sym, year, quarter, url: target.url });
+  }
+
+  console.log(`  [ir_pr] fetching ${target.url.slice(0, 80)}`);
+  const raw = await fetchUrl(target.url);
+  let parsed: Record<string, unknown>;
+  try { parsed = JSON.parse(raw); } catch { parsed = {}; }
+
+  if (parsed.error) {
+    return JSON.stringify({ error: parsed.error, ticker: sym, year, quarter, url: target.url });
+  }
+
+  const content = String(parsed.content ?? '').slice(0, 15_000);
+  return JSON.stringify({
+    ticker: sym, year, quarter,
+    url: target.url,
+    title: target.title,
+    content,
+    chars: content.length,
+  });
+}
+
 /** 從 companies_database 取得該 ticker 的公司名與 CEO（供搜尋關鍵字用）。 */
 function getCompanyNameAndCeo(ticker: string): { name: string; ceo: string } {
   const dbPath = path.join(PROJECT_ROOT, 'data', 'database', 'companies_database.json');
@@ -808,8 +984,55 @@ const GAP_FILL_TOOLS: ToolDef[] = [
   {
     type: 'function',
     function: {
+      name: 'fetch_transcript',
+      description: '從 stockanalysis.com 抓取 earnings call 逐字稿（HTML 免費，含 15s timeout + PDF guard）。**優先於 ninja_api earningstranscript**。',
+      parameters: {
+        type: 'object',
+        properties: {
+          ticker: { type: 'string', description: '公司 ticker（大寫）' },
+          year: { type: 'number', description: '財報年份，如 2024' },
+          quarter: { type: 'number', description: '季度 1-4' },
+        },
+        required: ['ticker', 'year', 'quarter'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'fetch_sec_xbrl',
+      description: 'SEC EDGAR XBRL API 取結構化財務 JSON（絕不是 PDF）。提供 ticker（或 cik），回傳 Revenue / NetIncome / Assets / EPS 等近 8 年 10-K 年度序列。**優先於 ninja_api earnings**。',
+      parameters: {
+        type: 'object',
+        properties: {
+          ticker: { type: 'string', description: '公司 ticker（大寫）' },
+          cik: { type: 'string', description: 'SEC CIK（選填，10 位數字；不填則自動查詢）' },
+        },
+        required: ['ticker'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'fetch_ir_press_release',
+      description: '搜尋並抓取公司 IR 頁面的 earnings press release HTML（自動避開 PDF）。含 revenue / EPS / guidance 等原始數字與 management commentary。**優先於 fetch_url 隨意抓 IR 頁**。',
+      parameters: {
+        type: 'object',
+        properties: {
+          ticker: { type: 'string', description: '公司 ticker（大寫）' },
+          year: { type: 'number', description: '財報年份' },
+          quarter: { type: 'number', description: '季度 1-4' },
+        },
+        required: ['ticker', 'year', 'quarter'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'ninja_api',
-      description: '呼叫 API Ninjas：財報(earnings/earnings_historical)、法說逐字稿(earningstranscript)、股價(stockprice)、SEC(sec)。需 NINJA_API_KEY。',
+      description: '【備用】API Ninjas：財報(earnings/earnings_historical)、法說逐字稿(earningstranscript)、股價(stockprice)、SEC 文件列表(sec)。需 NINJA_API_KEY；Premium 端點可能 402。**優先改用 fetch_transcript / fetch_sec_xbrl / fetch_ir_press_release**。',
       parameters: {
         type: 'object',
         properties: {
@@ -1042,6 +1265,18 @@ ${topGaps}
         case 'read_project_file':
           console.log(`  [read_project] ${args.path?.slice(0, 60)}...`);
           result = readProjectFile(args.path ?? '');
+          break;
+        case 'fetch_transcript':
+          console.log(`  [transcript] ${args.ticker ?? ticker} Q${args.quarter} ${args.year}`);
+          result = await fetchTranscript(String(args.ticker ?? ticker), Number(args.year), Number(args.quarter));
+          break;
+        case 'fetch_sec_xbrl':
+          console.log(`  [sec_xbrl] ${args.ticker ?? ticker} cik=${args.cik ?? 'auto'}`);
+          result = await fetchSecXbrl(String(args.ticker ?? ticker), args.cik ? String(args.cik) : undefined);
+          break;
+        case 'fetch_ir_press_release':
+          console.log(`  [ir_pr] ${args.ticker ?? ticker} Q${args.quarter} ${args.year}`);
+          result = await fetchIrPressRelease(String(args.ticker ?? ticker), Number(args.year), Number(args.quarter));
           break;
         default:
           result = JSON.stringify({ error: `Unknown tool: ${tc.function.name}` });
