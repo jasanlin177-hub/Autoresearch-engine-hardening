@@ -19,10 +19,40 @@
  */
 import fs from 'fs';
 import path from 'path';
+import https from 'https';
 import { execSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { chat, type Message, type ToolDef, type ToolCall } from './llm.js';
 import { scoreCompanyResearch, type InitialMaxScore, type InitialMaxGaps } from './initial-max-scorer.js';
+
+/** 強制 IPv4 + 略過 SSL revocation（Windows SChannel 相容） */
+const _tlsAgent = new https.Agent({ rejectUnauthorized: false });
+
+async function httpsFetch(url: string, init?: { headers?: Record<string, string>; method?: string; body?: string }): Promise<{ ok: boolean; status: number; text(): Promise<string>; json(): Promise<unknown> }> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const opts: https.RequestOptions = {
+      hostname: parsed.hostname,
+      path: parsed.pathname + parsed.search,
+      method: init?.method ?? 'GET',
+      headers: init?.headers ?? {},
+      agent: _tlsAgent,
+      family: 4,
+    };
+    if (init?.body) (opts.headers as Record<string, string>)['Content-Length'] = String(Buffer.byteLength(init.body));
+    const req = https.request(opts, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (c: Buffer) => chunks.push(c));
+      res.on('end', () => {
+        const raw = Buffer.concat(chunks).toString('utf-8');
+        resolve({ ok: (res.statusCode ?? 0) >= 200 && (res.statusCode ?? 0) < 300, status: res.statusCode ?? 0, text: async () => raw, json: async () => JSON.parse(raw) });
+      });
+    });
+    req.on('error', reject);
+    if (init?.body) req.write(init.body);
+    req.end();
+  });
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '..');
@@ -52,12 +82,8 @@ function parseArgs() {
     const arg = process.argv[i];
     if (arg.startsWith('--')) {
       const key = arg.slice(2);
-      // ── #7 補強：--why 等多字參數正確解析（收集所有非 -- 開頭的 token）──
-      const vals: string[] = [];
-      while (process.argv[i + 1] && !process.argv[i + 1].startsWith('--')) {
-        vals.push(process.argv[++i]);
-      }
-      args[key] = vals.length > 0 ? vals.join(' ') : 'true';
+      const val = process.argv[i + 1] && !process.argv[i + 1].startsWith('--') ? process.argv[++i] : 'true';
+      args[key] = val;
     }
   }
   return args;
@@ -67,23 +93,6 @@ function parseArgs() {
 
 function exec(cmd: string): string {
   return execSync(cmd, { cwd: PROJECT_ROOT, encoding: 'utf-8', timeout: 60_000 }).trim();
-}
-
-/** ── #6 補強：Runner 啟動時確保 git repo 存在，若無則自動 init + 初始 commit ── */
-function ensureGitRepo(): void {
-  try {
-    exec('git rev-parse --git-dir');
-  } catch {
-    console.log('[git] Not a git repository. Auto-initializing...');
-    exec('git init');
-    try {
-      exec('git add -A');
-      exec('git commit -m "chore: auto-init by initial-max-runner"');
-      console.log('[git] ✓ Git repo initialized with initial commit.');
-    } catch {
-      console.log('[git] ✓ Git repo initialized (no files to commit yet).');
-    }
-  }
 }
 
 function gitShortHash(): string {
@@ -149,7 +158,7 @@ async function webSearch(query: string, count = 5): Promise<string> {
       const url = new URL('https://api.search.brave.com/res/v1/web/search');
       url.searchParams.set('q', query);
       url.searchParams.set('count', String(num));
-      const res = await fetch(url.toString(), {
+      const res = await httpsFetch(url.toString(), {
         headers: { Accept: 'application/json', 'X-Subscription-Token': braveKey },
       });
       if (res.ok) {
@@ -164,7 +173,7 @@ async function webSearch(query: string, count = 5): Promise<string> {
   // DuckDuckGo fallback
   try {
     const ddgUrl = `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`;
-    const res = await fetch(ddgUrl, {
+    const res = await httpsFetch(ddgUrl, {
       headers: {
         Accept: 'text/html',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/115.0',
@@ -190,70 +199,15 @@ async function webSearch(query: string, count = 5): Promise<string> {
   }
 }
 
-/** fetch_url 最大等待時間（秒） */
-const FETCH_TIMEOUT_MS = 15_000;
-
-/** PDF URL 或 Content-Type 偵測用的 patterns */
-const PDF_URL_PATTERNS = /\.pdf(\?|#|$)/i;
-const PDF_CONTENT_TYPES = /application\/(pdf|octet-stream)/i;
-
 async function fetchUrl(url: string): Promise<string> {
-  // ── #1 補強：PDF URL 偵測（不嘗試下載，直接跳過）──
-  if (PDF_URL_PATTERNS.test(url)) {
-    console.log(`  [fetch] SKIP PDF URL: ${url.slice(0, 80)}`);
-    return JSON.stringify({
-      error: 'PDF URL 已跳過（下載 PDF 會永久卡死）。請改用 fetch_transcript 或 SEC XBRL。',
-      url,
-      skipped_reason: 'pdf_url',
-    });
-  }
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-
   try {
-    // HEAD 預檢：確認 Content-Type 不是 PDF
-    try {
-      const headRes = await fetch(url, {
-        method: 'HEAD',
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/115.0' },
-        signal: controller.signal,
-      });
-      const ct = headRes.headers.get('content-type') ?? '';
-      if (PDF_CONTENT_TYPES.test(ct)) {
-        clearTimeout(timer);
-        console.log(`  [fetch] SKIP PDF Content-Type (${ct}): ${url.slice(0, 80)}`);
-        return JSON.stringify({
-          error: `Content-Type "${ct}" 為 PDF，已跳過。請改用 fetch_transcript 或 SEC XBRL。`,
-          url,
-          skipped_reason: 'pdf_content_type',
-        });
-      }
-    } catch {
-      // HEAD 失敗不影響 GET，繼續
-    }
-
-    const res = await fetch(url, {
+    const res = await httpsFetch(url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/115.0',
         Accept: 'text/html,text/plain',
       },
-      signal: controller.signal,
     });
-    clearTimeout(timer);
-
     if (!res.ok) return JSON.stringify({ error: `HTTP ${res.status}` });
-
-    // GET 回應的 Content-Type 二次確認
-    const ct = res.headers.get('content-type') ?? '';
-    if (PDF_CONTENT_TYPES.test(ct)) {
-      return JSON.stringify({
-        error: `回應 Content-Type "${ct}" 為 PDF，已跳過。請改用 fetch_transcript 或 SEC XBRL。`,
-        url,
-        skipped_reason: 'pdf_content_type',
-      });
-    }
-
     const text = await res.text();
     // Strip most HTML tags, keep text content
     const stripped = text
@@ -266,16 +220,6 @@ async function fetchUrl(url: string): Promise<string> {
       .slice(0, 12000);
     return JSON.stringify({ url, content: stripped });
   } catch (err: any) {
-    clearTimeout(timer);
-    // ── #1 補強：timeout 明確回報 ──
-    if (err.name === 'AbortError') {
-      console.log(`  [fetch] TIMEOUT (${FETCH_TIMEOUT_MS / 1000}s): ${url.slice(0, 80)}`);
-      return JSON.stringify({
-        error: `fetch_url 超時（${FETCH_TIMEOUT_MS / 1000}s）— 此 URL 回應過慢或檔案過大，已跳過。`,
-        url,
-        skipped_reason: 'timeout',
-      });
-    }
     return JSON.stringify({ error: err.message });
   }
 }
@@ -306,64 +250,13 @@ function findSectionRange(lines: string[], sectionAnchor: string): [number, numb
   return [sectionStart, sectionEnd];
 }
 
-/** ── #5 補強：寫入後清理重複 heading（同一 ## X.Y 出現 2 次以上 → 保留最後一次）── */
-function deduplicateSections(fullPath: string): void {
-  const raw = fs.readFileSync(fullPath, 'utf-8');
-  const lines = raw.split(/\r?\n/);
-
-  // 找出所有 ## / ### 數字錨點 heading 的出現位置
-  const headingPositions = new Map<string, number[]>();
-  for (let i = 0; i < lines.length; i++) {
-    const m = lines[i].match(/^(#{2,3})\s+(\d+\.\d+)\b/);
-    if (m) {
-      const key = m[2]; // e.g. "1.1", "2.3"
-      if (!headingPositions.has(key)) headingPositions.set(key, []);
-      headingPositions.get(key)!.push(i);
-    }
-  }
-
-  // 若有重複，刪除較早的整節（保留最後一次）
-  let changed = false;
-  const linesToRemove = new Set<number>();
-  for (const [key, positions] of headingPositions) {
-    if (positions.length <= 1) continue;
-    console.warn(`  [dedup] Found ${positions.length} occurrences of heading "${key}", keeping last.`);
-    // 刪除除最後一次以外的所有節
-    for (let p = 0; p < positions.length - 1; p++) {
-      const start = positions[p];
-      // 找到這一節的結束（下一個 heading 之前）
-      let end = lines.length;
-      for (let j = start + 1; j < lines.length; j++) {
-        if (/^#{2,3}\s+/.test(lines[j])) { end = j; break; }
-      }
-      for (let j = start; j < end; j++) linesToRemove.add(j);
-      changed = true;
-    }
-  }
-
-  if (changed) {
-    const cleaned = lines.filter((_, i) => !linesToRemove.has(i)).join('\n');
-    fs.writeFileSync(fullPath, cleaned);
-  }
-}
-
-/** 將 content 插入 section_anchor 對應小節的結尾（下一小節之前）。
- *  ── #5 補強：若該 anchor 已有實質內容（>80字元），自動升級為 replaceSection 避免重複堆疊 ── */
+/** 將 content 插入 section_anchor 對應小節的結尾（下一小節之前）。 */
 function insertIntoSection(fullPath: string, sectionAnchor: string, content: string): boolean {
   const raw = fs.readFileSync(fullPath, 'utf-8');
   const lines = raw.split(/\r?\n/);
   const range = findSectionRange(lines, sectionAnchor);
   if (!range) return false;
-  const [sectionStart, insertBefore] = range;
-
-  // 檢查該節現有內容是否已有實質文字
-  const existingBody = lines.slice(sectionStart + 1, insertBefore).join('\n').trim();
-  if (existingBody.length > 80) {
-    // 已有內容 → 強制改用 replaceSection，防止重複堆疊
-    console.log(`  [dedup] anchor "${sectionAnchor}" already has content (${existingBody.length} chars), upgrading insert→replace.`);
-    return replaceSection(fullPath, sectionAnchor, content);
-  }
-
+  const [, insertBefore] = range;
   const newBlock = content.trim();
   const before = lines.slice(0, insertBefore).join('\n').trimEnd();
   const after = lines.slice(insertBefore).join('\n');
@@ -404,28 +297,6 @@ function writeResearchSection(
   }
 
   const fullPath = path.join(dir, filename);
-
-  // ── #2 補強：overwrite 前自動備份 ──
-  const isMainFile = filename.endsWith('_Initial_MAX.md');
-  if (mode === 'overwrite' && isMainFile && fs.existsSync(fullPath)) {
-    const bakPath = fullPath + '.bak';
-    fs.copyFileSync(fullPath, bakPath);
-    console.log(`  [write] 備份已存至 ${filename}.bak`);
-  }
-
-  // ── #2 補強：最小字數驗證（防止佔位符覆蓋真實內容）──
-  if (isMainFile && fs.existsSync(fullPath)) {
-    const existingChars = fs.readFileSync(fullPath, 'utf-8').length;
-    if (existingChars > 500 && content.length < existingChars * 0.5) {
-      console.warn(`  [write] REJECTED — 新內容 ${content.length} 字元 < 現有 ${existingChars} 字元的 50%，疑似佔位符，拒絕寫入。`);
-      return JSON.stringify({
-        error: `寫入被拒絕：新內容（${content.length} 字元）不足現有檔案（${existingChars} 字元）的 50%，疑似為摘要或佔位符。請用 replace_section 逐節修正，或確認 content 為完整全文後再用 overwrite。`,
-        existing_chars: existingChars,
-        new_chars: content.length,
-      });
-    }
-  }
-
   if (mode === 'overwrite') {
     fs.writeFileSync(fullPath, content);
     return JSON.stringify({ status: 'written', file: `data/companies/${ticker}/${filename}`, chars: content.length });
@@ -440,14 +311,12 @@ function writeResearchSection(
       if (!ok) {
         return JSON.stringify({ error: `section_anchor "${sectionAnchor}" not found; use insert_into_section or overwrite` });
       }
-      if (isMainFile) deduplicateSections(fullPath); // ── #5 補強
       return JSON.stringify({ status: 'replaced_section', file: `data/companies/${ticker}/${filename}`, section_anchor: sectionAnchor, chars: content.length });
     }
     const ok = insertIntoSection(fullPath, sectionAnchor, content);
     if (!ok) {
       return JSON.stringify({ error: `section_anchor "${sectionAnchor}" not found in file; use append or overwrite` });
     }
-    if (isMainFile) deduplicateSections(fullPath); // ── #5 補強
     return JSON.stringify({ status: 'inserted_into_section', file: `data/companies/${ticker}/${filename}`, section_anchor: sectionAnchor, chars: content.length });
   }
   const existing = fs.existsSync(fullPath) ? fs.readFileSync(fullPath, 'utf-8') : '';
@@ -562,7 +431,7 @@ async function callNinjaApi(action: string, args: Record<string, unknown>): Prom
       u.searchParams.set('year', String(y));
       u.searchParams.set('quarter', '4');
       try {
-        const res = await fetch(u.toString(), { headers: { 'X-Api-Key': key } });
+        const res = await httpsFetch(u.toString(), { headers: { 'X-Api-Key': key } });
         const data = res.ok ? await res.json() : null;
         results.push({ year: y, data });
       } catch (e: any) {
@@ -583,7 +452,7 @@ async function callNinjaApi(action: string, args: Record<string, unknown>): Prom
   const url = new URL(NINJA_BASE + p);
   Object.entries(params).forEach(([k, v]) => { if (v !== undefined && v !== '') url.searchParams.set(k, String(v)); });
   try {
-    const res = await fetch(url.toString(), { headers: { 'X-Api-Key': key } });
+    const res = await httpsFetch(url.toString(), { headers: { 'X-Api-Key': key } });
     if (!res.ok) {
       const text = await res.text();
       if (res.status === 402 || res.status === 403) return JSON.stringify({ error: '此端點為 API Ninjas Premium 限定' });
@@ -596,180 +465,322 @@ async function callNinjaApi(action: string, args: Record<string, unknown>): Prom
   }
 }
 
-// ── #9 補強：結構化財務直取工具 ──
+// ══════════════════════════════════════════════════════
+// ── 確定性金融數據預取（Step 0，LLM 介入前執行）──
+// ══════════════════════════════════════════════════════
 
-/**
- * 從 stockanalysis.com 抓取 earnings call 逐字稿 HTML。
- * URL: https://stockanalysis.com/stocks/{ticker}/transcripts/q{quarter}-{year}/
- */
-async function fetchTranscript(ticker: string, year: number, quarter: number): Promise<string> {
-  const sym = cleanTicker(ticker);
-  const url = `https://stockanalysis.com/stocks/${sym.toLowerCase()}/transcripts/q${quarter}-${year}/`;
-  console.log(`  [transcript] fetching ${url}`);
-
-  const raw = await fetchUrl(url);
-  let parsed: Record<string, unknown>;
-  try { parsed = JSON.parse(raw); } catch { parsed = {}; }
-
-  // fetchUrl 已回傳 error（PDF / timeout / HTTP error）
-  if (parsed.error) {
-    return JSON.stringify({ error: parsed.error, ticker: sym, year, quarter, url });
-  }
-
-  const content = String(parsed.content ?? '');
-  if (content.length < 200) {
-    return JSON.stringify({
-      error: `逐字稿內容過短（${content.length} 字元），可能頁面不存在或需登入。`,
-      ticker: sym, year, quarter, url,
-    });
-  }
-
-  const truncated = content.slice(0, 25_000);
-  return JSON.stringify({
-    ticker: sym, year, quarter, url,
-    content: truncated,
-    chars: truncated.length,
-    total_chars: content.length,
-    ...(content.length > 25_000 ? { note: `僅前 25000 字元，全文共 ${content.length} 字元` } : {}),
-  });
+interface FinancialYearData {
+  year: number;
+  revenue?: number;
+  ocf?: number;
+  capex?: number;
+  sbc?: number;
+  dilutedShares?: number;
+  eps?: number;
 }
 
-/**
- * SEC EDGAR XBRL API 取結構化財務 JSON（絕不是 PDF）。
- * 若提供 cik → 直接查 companyfacts；否則先搜尋 CIK。
- * 回傳 Revenues / NetIncomeLoss / OperatingIncomeLoss / Assets / StockholdersEquity / EarningsPerShareBasic 近 8 年 10-K 數據。
- */
-async function fetchSecXbrl(ticker: string, cik?: string): Promise<string> {
-  const sym = cleanTicker(ticker);
-  const CONCEPTS = [
-    'Revenues', 'RevenueFromContractWithCustomerExcludingAssessedTax',
-    'NetIncomeLoss', 'OperatingIncomeLoss',
-    'Assets', 'StockholdersEquity', 'EarningsPerShareBasic',
-  ];
+interface ValuationMetrics {
+  date: string;
+  price: number;
+  marketCapM: number;
+  latestYear: number;
+  priorYear?: number;
+  revenue?: number;
+  ps?: number;
+  ocfM?: number;
+  capexM?: number;
+  sbcM?: number;
+  fcfM?: number;
+  fcfMarginPct?: number;
+  fcfSbcM?: number;
+  fcfSbcMarginPct?: number;
+  dilutedSharesM?: number;
+  pFcf?: number;
+  fcfGrowthPct?: number;
+  fcfPeg?: number;
+  pe?: number;
+  epsGrowthPct?: number;
+  peg?: number;
+}
 
-  // Step 1: resolve CIK
-  let resolvedCik = cik ? String(cik).replace(/\D/g, '').padStart(10, '0') : '';
-  if (!resolvedCik) {
-    try {
-      const searchUrl = `https://efts.sec.gov/LATEST/search-index?q=%22${encodeURIComponent(sym)}%22&dateRange=custom&startdt=2020-01-01&forms=10-K`;
-      const res = await fetch(searchUrl, {
-        headers: { 'User-Agent': 'AutoResearch/1.0 jasanlin177@gmail.com', Accept: 'application/json' },
-        signal: AbortSignal.timeout(10_000),
-      });
-      if (res.ok) {
-        const data = await res.json() as any;
-        const hit = data?.hits?.hits?.[0]?._source;
-        if (hit?.entity_id) resolvedCik = String(hit.entity_id).padStart(10, '0');
-      }
-    } catch {}
+/** Step 0a: 從 API Ninjas 取得當前股價（確定性呼叫，不依賴 LLM 判斷）。 */
+async function fetchCurrentPrice(ticker: string): Promise<{ price: number; date: string } | null> {
+  try {
+    const raw = await callNinjaApi('stockprice', { ticker });
+    const data = JSON.parse(raw);
+    if (data.error || data.price === undefined) return null;
+    const price = Number(data.price);
+    if (!isFinite(price) || price <= 0) return null;
+    return { price, date: new Date().toISOString().slice(0, 10) };
+  } catch {
+    return null;
   }
+}
 
-  if (!resolvedCik) {
-    // fallback: company_tickers.json
-    try {
-      const res = await fetch('https://www.sec.gov/files/company_tickers.json', {
-        headers: { 'User-Agent': 'AutoResearch/1.0 jasanlin177@gmail.com' },
-        signal: AbortSignal.timeout(10_000),
-      });
-      if (res.ok) {
-        const data = await res.json() as any;
-        for (const v of Object.values(data) as any[]) {
-          if ((v.ticker ?? '').toUpperCase() === sym) {
-            resolvedCik = String(v.cik_str).padStart(10, '0');
-            break;
-          }
+/** Step 0b: 將 SEC EDGAR ticker 解析為 CIK（10 位補零）。 */
+async function resolveCik(ticker: string): Promise<string | null> {
+  try {
+    // 方法一：efts 搜尋索引
+    const searchUrl = `https://efts.sec.gov/LATEST/search-index?q=%22${encodeURIComponent(ticker)}%22&forms=10-K`;
+    const res = await httpsFetch(searchUrl, { headers: { 'User-Agent': 'EquityResearch/1.0 research@example.com' } });
+    if (res.ok) {
+      const body = await res.json() as any;
+      const hits = body?.hits?.hits ?? [];
+      for (const hit of hits) {
+        const source = hit?._source ?? {};
+        const cikRaw: string | number | undefined = source?.entity_id ?? source?.cik;
+        if (cikRaw !== undefined) {
+          return String(cikRaw).replace(/\D/g, '').padStart(10, '0');
         }
       }
-    } catch {}
-  }
-
-  if (!resolvedCik) {
-    return JSON.stringify({ error: `找不到 ${sym} 的 SEC CIK，請手動提供 cik 參數。`, ticker: sym });
-  }
-
-  // Step 2: fetch companyfacts
-  const factsUrl = `https://data.sec.gov/api/xbrl/companyfacts/CIK${resolvedCik}.json`;
-  console.log(`  [sec_xbrl] fetching ${factsUrl}`);
-  let factsData: any;
-  try {
-    const res = await fetch(factsUrl, {
-      headers: { 'User-Agent': 'AutoResearch/1.0 jasanlin177@gmail.com', Accept: 'application/json' },
-      signal: AbortSignal.timeout(15_000),
+    }
+    // 方法二：company.json 映射（SEC 官方）
+    const mapRes = await httpsFetch('https://www.sec.gov/files/company_tickers.json', {
+      headers: { 'User-Agent': 'EquityResearch/1.0 research@example.com' },
     });
-    if (!res.ok) return JSON.stringify({ error: `SEC EDGAR HTTP ${res.status}`, ticker: sym, cik: resolvedCik });
-    factsData = await res.json();
-  } catch (e: any) {
-    return JSON.stringify({ error: e?.message ?? 'fetch failed', ticker: sym, cik: resolvedCik });
+    if (mapRes.ok) {
+      const map = await mapRes.json() as Record<string, { cik_str: number; ticker: string; title: string }>;
+      const upper = ticker.toUpperCase();
+      for (const entry of Object.values(map)) {
+        if (entry.ticker.toUpperCase() === upper) {
+          return String(entry.cik_str).padStart(10, '0');
+        }
+      }
+    }
+    return null;
+  } catch {
+    return null;
   }
-
-  const usGaap = factsData?.facts?.['us-gaap'] ?? {};
-  const summary: Record<string, { unit: string; annual: { year: number; val: number; filed: string }[] }> = {};
-
-  for (const concept of CONCEPTS) {
-    if (!usGaap[concept]) continue;
-    const units = usGaap[concept].units ?? {};
-    const unitKey = Object.keys(units)[0]; // USD, shares, USD/shares
-    if (!unitKey) continue;
-    const rows: any[] = units[unitKey] ?? [];
-    // 只要 form=10-K，取 frame 或 fy 標記的 annual 數據
-    const annual = rows
-      .filter((r: any) => r.form === '10-K' && r.fp === 'FY' && r.val != null)
-      .sort((a: any, b: any) => b.fy - a.fy)
-      .slice(0, 8)
-      .map((r: any) => ({ year: r.fy, val: r.val, filed: r.filed ?? '' }));
-    if (annual.length > 0) summary[concept] = { unit: unitKey, annual };
-  }
-
-  const out = JSON.stringify({ ticker: sym, cik: resolvedCik, source: factsUrl, financials: summary }, null, 2);
-  return out.length > 8_000 ? out.slice(0, 8_000) + '\n...(截斷)' : out;
 }
 
-/**
- * 搜尋並抓取公司 IR 頁面的 earnings press release HTML（自動避開 PDF）。
- * 先用 webSearch 找到最相關的新聞稿 URL，再 fetchUrl 抓取全文。
- */
-async function fetchIrPressRelease(ticker: string, year: number, quarter: number): Promise<string> {
-  const sym = cleanTicker(ticker);
-  const query = `${sym} Q${quarter} ${year} earnings press release investor relations`;
-  console.log(`  [ir_pr] searching: ${query}`);
-
-  const searchRaw = await webSearch(query, 5);
-  let results: { title: string; url: string; description: string }[] = [];
-  try {
-    const parsed = JSON.parse(searchRaw);
-    results = parsed.results ?? [];
-  } catch {}
-
-  // 優先選含 ir. / investor / press-release 的結果，排除 PDF
-  const candidates = results.filter(
-    (r) => !PDF_URL_PATTERNS.test(r.url) &&
-      (r.url.includes('ir.') || r.url.includes('investor') || r.url.includes('press-release') || r.url.includes('newsroom')),
+/** Step 0c helper: 從 us-gaap 概念中提取最近年度數值（僅 10-K，取最大 end date 的那筆）。 */
+function extractXbrlAnnual(
+  usgaap: Record<string, any>,
+  conceptName: string,
+): { year: number; valM: number }[] {
+  const concept = usgaap?.[conceptName];
+  if (!concept) return [];
+  // 找最長 duration 的 unit（優先 USD，shares 次之）
+  const units: any[] = concept?.units?.USD ?? concept?.units?.shares ?? [];
+  const annuals = units.filter((u: any) => u.form === '10-K' && u.frame === undefined
+    ? false  // 有些用 frame，有些沒有——只要 form=10-K 且有 start/end
+    : u.form === '10-K' && u.start !== undefined && u.end !== undefined
   );
-  const target = (candidates[0] ?? results[0]);
-  if (!target) {
-    return JSON.stringify({ error: '找不到 IR press release 搜尋結果', ticker: sym, year, quarter });
+  // 依 end date 分組，同一年取最新 accn（最後申報的）
+  const byYear: Record<number, { end: string; val: number }> = {};
+  for (const u of annuals) {
+    const endYear = new Date(u.end).getFullYear();
+    const startYear = new Date(u.start).getFullYear();
+    const months = (endYear - startYear) * 12 + (new Date(u.end).getMonth() - new Date(u.start).getMonth());
+    if (months < 9 || months > 15) continue; // 只取約 12 個月的數據
+    if (!byYear[endYear] || u.end > byYear[endYear].end) {
+      byYear[endYear] = { end: u.end, val: u.val };
+    }
   }
-  if (PDF_URL_PATTERNS.test(target.url)) {
-    return JSON.stringify({ error: 'IR press release URL 為 PDF，已跳過。請用 fetch_sec_xbrl 取結構化財務數據。', ticker: sym, year, quarter, url: target.url });
+  return Object.entries(byYear)
+    .sort(([a], [b]) => Number(b) - Number(a))
+    .slice(0, 4)
+    .map(([year, { val }]) => ({ year: Number(year), valM: Math.round(val / 1e6) }));
+}
+
+/** Step 0d: 從 SEC EDGAR XBRL 抓取現金流量科目（OCF/CapEx/SBC/稀釋股數）。 */
+async function fetchSecXbrlMetrics(ticker: string): Promise<FinancialYearData[] | null> {
+  try {
+    const cik = await resolveCik(ticker);
+    if (!cik) { console.warn(`  ⚠ SEC CIK 解析失敗（${ticker}）`); return null; }
+    console.log(`  SEC CIK: ${cik}`);
+
+    const factsUrl = `https://data.sec.gov/api/xbrl/companyfacts/CIK${cik}.json`;
+    const res = await httpsFetch(factsUrl, { headers: { 'User-Agent': 'EquityResearch/1.0 research@example.com' } });
+    if (!res.ok) { console.warn(`  ⚠ SEC XBRL fetch 失敗: ${res.status}`); return null; }
+
+    const facts = await res.json() as any;
+    const usgaap = facts?.facts?.['us-gaap'] ?? {};
+
+    const ocfSeries   = extractXbrlAnnual(usgaap, 'NetCashProvidedByUsedInOperatingActivities');
+    const capexSeries = extractXbrlAnnual(usgaap, 'PaymentsToAcquirePropertyPlantAndEquipment');
+    const sbcSeries   = extractXbrlAnnual(usgaap, 'ShareBasedCompensation');
+    // 稀釋股數（shares 單位）
+    const sharesSeries = (() => {
+      const c = usgaap?.['WeightedAverageNumberOfDilutedSharesOutstanding'];
+      if (!c) return [] as { year: number; valM: number }[];
+      const units: any[] = c?.units?.shares ?? [];
+      const annuals = units.filter((u: any) => u.form === '10-K' && u.start !== undefined && u.end !== undefined);
+      const byYear: Record<number, { end: string; val: number }> = {};
+      for (const u of annuals) {
+        const endYear = new Date(u.end).getFullYear();
+        const startYear = new Date(u.start).getFullYear();
+        const months = (endYear - startYear) * 12 + (new Date(u.end).getMonth() - new Date(u.start).getMonth());
+        if (months < 9 || months > 15) continue;
+        if (!byYear[endYear] || u.end > byYear[endYear].end) {
+          byYear[endYear] = { end: u.end, val: u.val };
+        }
+      }
+      return Object.entries(byYear)
+        .sort(([a], [b]) => Number(b) - Number(a))
+        .slice(0, 4)
+        .map(([year, { val }]) => ({ year: Number(year), valM: Math.round(val / 1e6) }));
+    })();
+
+    // 收入（Revenues / RevenueFromContractWithCustomerExcludingAssessedTax）
+    const revSeries = extractXbrlAnnual(usgaap, 'RevenueFromContractWithCustomerExcludingAssessedTax').length > 0
+      ? extractXbrlAnnual(usgaap, 'RevenueFromContractWithCustomerExcludingAssessedTax')
+      : extractXbrlAnnual(usgaap, 'Revenues');
+
+    // 合併成 FinancialYearData[]（最近 3 年）
+    const allYears = ocfSeries.map(x => x.year)
+      .concat(capexSeries.map(x => x.year))
+      .concat(sbcSeries.map(x => x.year));
+    const years = allYears.filter((yr, idx) => allYears.indexOf(yr) === idx)
+      .sort((a, b) => b - a).slice(0, 3);
+
+    if (years.length === 0) { console.warn('  ⚠ SEC XBRL：找不到足夠的年度數據'); return null; }
+
+    return years.map(yr => ({
+      year: yr,
+      revenue:       revSeries.find(x => x.year === yr)?.valM,
+      ocf:           ocfSeries.find(x => x.year === yr)?.valM,
+      capex:         capexSeries.find(x => x.year === yr)?.valM ?? 0,
+      sbc:           sbcSeries.find(x => x.year === yr)?.valM ?? 0,
+      dilutedShares: sharesSeries.find(x => x.year === yr)?.valM,
+    }));
+  } catch (e: any) {
+    console.warn(`  ⚠ fetchSecXbrlMetrics 錯誤: ${e?.message}`);
+    return null;
+  }
+}
+
+/** Step 0e: 從 API Ninjas 取得 EPS 歷史，補進 FinancialYearData。 */
+async function enrichWithEps(data: FinancialYearData[]): Promise<void> {
+  try {
+    const raw = await callNinjaApi('earnings_historical', { ticker: '' }); // ticker 將由呼叫方注入
+    // earnings_historical 回傳格式：[{ fiscal_year, eps_actual, ... }]
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return;
+    for (const row of arr) {
+      const yr = Number(row.fiscal_year ?? row.year ?? 0);
+      const eps = row.eps_actual ?? row.eps ?? null;
+      if (!yr || eps === null) continue;
+      const entry = data.find(d => d.year === yr);
+      if (entry) entry.eps = Number(eps);
+    }
+  } catch { /* EPS 非關鍵，靜默失敗 */ }
+}
+
+/** Step 0f: 計算估值指標。 */
+function calculateValuationMetrics(
+  priceData: { price: number; date: string } | null,
+  xbrlData: FinancialYearData[] | null,
+): ValuationMetrics | null {
+  if (!priceData) return null;
+  const { price, date } = priceData;
+
+  const latest = xbrlData?.[0];
+  const prior  = xbrlData?.[1];
+  if (!latest) return { date, price, marketCapM: 0, latestYear: new Date().getFullYear() - 1 };
+
+  const sharesM   = latest.dilutedShares ?? 0;
+  const marketCapM = sharesM > 0 ? Math.round(price * sharesM) : 0;
+  const revenueM  = latest.revenue;
+  const ocfM      = latest.ocf ?? 0;
+  const capexM    = latest.capex ?? 0;
+  const sbcM      = latest.sbc ?? 0;
+  const fcfM      = ocfM - capexM;
+  const fcfSbcM   = fcfM - sbcM;
+
+  const ps        = revenueM && marketCapM > 0 ? +(marketCapM / revenueM).toFixed(1) : undefined;
+  const fcfMarginPct = revenueM && fcfM ? +(fcfM / revenueM * 100).toFixed(1) : undefined;
+  const fcfSbcMarginPct = revenueM && fcfSbcM ? +(fcfSbcM / revenueM * 100).toFixed(1) : undefined;
+
+  // FCF per share → P/FCF
+  const fcfPerShare  = sharesM > 0 && fcfM > 0 ? fcfM / sharesM : undefined;
+  const pFcf         = fcfPerShare ? +(price / fcfPerShare).toFixed(1) : undefined;
+
+  // FCF growth YoY
+  const priorFcf = prior ? (prior.ocf ?? 0) - (prior.capex ?? 0) : undefined;
+  const fcfGrowthPct = priorFcf && priorFcf > 0 && fcfM > 0
+    ? +((fcfM / priorFcf - 1) * 100).toFixed(1) : undefined;
+  const fcfPeg = pFcf && fcfGrowthPct && fcfGrowthPct > 0
+    ? +(pFcf / fcfGrowthPct).toFixed(2) : undefined;
+
+  // EPS PEG
+  const latestEps = latest.eps;
+  const priorEps  = prior?.eps;
+  const pe = latestEps && latestEps > 0 ? +(price / latestEps).toFixed(1) : undefined;
+  const epsGrowthPct = latestEps && priorEps && priorEps > 0
+    ? +((latestEps / priorEps - 1) * 100).toFixed(1) : undefined;
+  const peg = pe && epsGrowthPct && epsGrowthPct > 0
+    ? +(pe / epsGrowthPct).toFixed(2) : undefined;
+
+  return {
+    date, price, marketCapM, latestYear: latest.year, priorYear: prior?.year,
+    revenue: revenueM, ps, ocfM, capexM, sbcM: sbcM || undefined,
+    fcfM: fcfM || undefined, fcfMarginPct, fcfSbcM: fcfSbcM || undefined, fcfSbcMarginPct,
+    dilutedSharesM: sharesM || undefined,
+    pFcf, fcfGrowthPct, fcfPeg,
+    pe, epsGrowthPct, peg,
+  };
+}
+
+/** Step 0g: 在報告最頂部寫入「關鍵估值指標」區塊（下次執行時覆蓋）。 */
+async function injectMetricsHeader(ticker: string, m: ValuationMetrics): Promise<void> {
+  const reportPath = path.join(PROJECT_ROOT, 'data', 'companies', ticker, `${ticker}_Initial_MAX.md`);
+  if (!fs.existsSync(reportPath)) return;
+
+  const fmt = (v: number | undefined, digits = 0, suffix = '') =>
+    v === undefined ? 'N/A' : `${v.toLocaleString('en-US', { maximumFractionDigits: digits })}${suffix}`;
+
+  const block = [
+    `## 關鍵估值指標（程式自動計算，每次執行時更新）`,
+    ``,
+    `> 資料日期：${m.date} | 股價來源：API Ninjas | 財務來源：SEC EDGAR XBRL（FY${m.latestYear}）`,
+    ``,
+    `| 指標 | 數值 | 說明 |`,
+    `|------|------|------|`,
+    `| 當前股價 | $${fmt(m.price, 2)} | ${m.date} 收盤 |`,
+    `| 市值 | $${fmt(m.marketCapM, 0)}M | 股價 × 稀釋股數 ${fmt(m.dilutedSharesM, 1)}M |`,
+    m.ps !== undefined ? `| FY${m.latestYear} P/S | ${fmt(m.ps, 1)}x | 市值 / 年度營收 $${fmt(m.revenue, 0)}M |` : null,
+    m.fcfM !== undefined ? `| FY${m.latestYear} FCF | $${fmt(m.fcfM, 0)}M | OCF $${fmt(m.ocfM, 0)}M − CapEx $${fmt(m.capexM, 0)}M |` : null,
+    m.fcfMarginPct !== undefined ? `| FCF Margin | ${fmt(m.fcfMarginPct, 1)}% | FCF / 營收 |` : null,
+    m.fcfSbcM !== undefined ? `| FCF − SBC | $${fmt(m.fcfSbcM, 0)}M | 真實股東盈利（扣除 SBC $${fmt(m.sbcM, 0)}M）|` : null,
+    m.fcfSbcMarginPct !== undefined ? `| FCF−SBC Margin | ${fmt(m.fcfSbcMarginPct, 1)}% | |` : null,
+    m.pFcf !== undefined ? `| P/FCF | ${fmt(m.pFcf, 1)}x | 股價 / FCF per share |` : null,
+    m.fcfPeg !== undefined ? `| FCF PEG | ${fmt(m.fcfPeg, 2)} | P/FCF ${fmt(m.pFcf, 1)}x ÷ FCF 成長率 ${fmt(m.fcfGrowthPct, 1)}% (FY${m.priorYear}→FY${m.latestYear}) |` : null,
+    m.peg !== undefined ? `| PEG（EPS） | ${fmt(m.peg, 2)} | P/E ${fmt(m.pe, 1)}x ÷ EPS 成長率 ${fmt(m.epsGrowthPct, 1)}% |` : null,
+    ``,
+    `> ⚠️ 此區塊由程式確定性寫入（LLM 不可覆蓋或重新計算此區塊的數字）。`,
+    ``,
+  ].filter(l => l !== null).join('\n');
+
+  let content = fs.readFileSync(reportPath, 'utf-8');
+
+  // 移除舊的指標區塊（若存在）
+  const blockStart = /^## 關鍵估值指標（程式自動計算/m;
+  const blockEnd   = /^> ⚠️ 此區塊由程式確定性寫入.*\n+/m;
+  if (blockStart.test(content)) {
+    const si = content.search(blockStart);
+    // 找到結束標記之後的位置
+    const sub = content.slice(si);
+    const ei = sub.search(blockEnd);
+    if (ei >= 0) {
+      const endIdx = sub.slice(ei).search(/\n/) + ei + 1;
+      // 額外消耗空行
+      let extra = 0;
+      while (si + endIdx + extra < content.length && content[si + endIdx + extra] === '\n') extra++;
+      content = content.slice(0, si) + content.slice(si + endIdx + extra);
+    }
   }
 
-  console.log(`  [ir_pr] fetching ${target.url.slice(0, 80)}`);
-  const raw = await fetchUrl(target.url);
-  let parsed: Record<string, unknown>;
-  try { parsed = JSON.parse(raw); } catch { parsed = {}; }
+  // 插入在報告最頂部（# 標題之前 or 第一行之前）
+  content = block + '\n' + content;
+  fs.writeFileSync(reportPath, content, 'utf-8');
 
-  if (parsed.error) {
-    return JSON.stringify({ error: parsed.error, ticker: sym, year, quarter, url: target.url });
+  // 同時更新 IRR header 中的「參考股價」
+  const pricePattern = /（參考股價：~\$[\d,.]+[^）]*）/;
+  const newPriceTag  = `（參考股價：~$${m.price.toFixed(2)} [${m.date}]）`;
+  if (pricePattern.test(content)) {
+    fs.writeFileSync(reportPath, fs.readFileSync(reportPath, 'utf-8').replace(pricePattern, newPriceTag), 'utf-8');
   }
-
-  const content = String(parsed.content ?? '').slice(0, 15_000);
-  return JSON.stringify({
-    ticker: sym, year, quarter,
-    url: target.url,
-    title: target.title,
-    content,
-    chars: content.length,
-  });
 }
 
 /** 從 companies_database 取得該 ticker 的公司名與 CEO（供搜尋關鍵字用）。 */
@@ -984,55 +995,8 @@ const GAP_FILL_TOOLS: ToolDef[] = [
   {
     type: 'function',
     function: {
-      name: 'fetch_transcript',
-      description: '從 stockanalysis.com 抓取 earnings call 逐字稿（HTML 免費，含 15s timeout + PDF guard）。**優先於 ninja_api earningstranscript**。',
-      parameters: {
-        type: 'object',
-        properties: {
-          ticker: { type: 'string', description: '公司 ticker（大寫）' },
-          year: { type: 'number', description: '財報年份，如 2024' },
-          quarter: { type: 'number', description: '季度 1-4' },
-        },
-        required: ['ticker', 'year', 'quarter'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'fetch_sec_xbrl',
-      description: 'SEC EDGAR XBRL API 取結構化財務 JSON（絕不是 PDF）。提供 ticker（或 cik），回傳 Revenue / NetIncome / Assets / EPS 等近 8 年 10-K 年度序列。**優先於 ninja_api earnings**。',
-      parameters: {
-        type: 'object',
-        properties: {
-          ticker: { type: 'string', description: '公司 ticker（大寫）' },
-          cik: { type: 'string', description: 'SEC CIK（選填，10 位數字；不填則自動查詢）' },
-        },
-        required: ['ticker'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'fetch_ir_press_release',
-      description: '搜尋並抓取公司 IR 頁面的 earnings press release HTML（自動避開 PDF）。含 revenue / EPS / guidance 等原始數字與 management commentary。**優先於 fetch_url 隨意抓 IR 頁**。',
-      parameters: {
-        type: 'object',
-        properties: {
-          ticker: { type: 'string', description: '公司 ticker（大寫）' },
-          year: { type: 'number', description: '財報年份' },
-          quarter: { type: 'number', description: '季度 1-4' },
-        },
-        required: ['ticker', 'year', 'quarter'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
       name: 'ninja_api',
-      description: '【備用】API Ninjas：財報(earnings/earnings_historical)、法說逐字稿(earningstranscript)、股價(stockprice)、SEC 文件列表(sec)。需 NINJA_API_KEY；Premium 端點可能 402。**優先改用 fetch_transcript / fetch_sec_xbrl / fetch_ir_press_release**。',
+      description: '呼叫 API Ninjas：財報(earnings/earnings_historical)、法說逐字稿(earningstranscript)、股價(stockprice)、SEC(sec)。需 NINJA_API_KEY。',
       parameters: {
         type: 'object',
         properties: {
@@ -1175,6 +1139,8 @@ ${topGaps}
 5. 地理/業務分部須標年報或法說出處（含連結）；每子點至少 5 則管理層原話（引號+出處+日期+訪談／逐字稿 **URL**）。
 6. 完成後輸出 JSON summary（見下方格式）${investorSection}
 
+> **⚠️ 關鍵估值指標區塊保護**：報告頂部「## 關鍵估值指標（程式自動計算，每次執行時更新）」區塊由程式在 LLM 介入**前**確定性寫入，數字來自即時 API（股價）與 SEC EDGAR XBRL（FCF/SBC 等）。**請勿覆蓋、重新計算或修改此區塊中的任何數字**。引用這些指標時，直接使用區塊中已有的數值，不要另行估算或查詢股價。
+
 **輸出格式**（在所有工具呼叫完成後）：
 {"description": "filled X interviews, added geographic revenue from 10-K, ...", "files_written": ["${mainFile}", "transcripts/..."], "interviews_added": 數字, "dimensions_addressed": [...]}`;
   }
@@ -1203,7 +1169,7 @@ ${topGaps}
   let finalResponse = '';
 
   for (let toolRound = 0; toolRound < MAX_TOOL_ROUNDS; toolRound++) {
-    const response = await chat(messages, { model, tools, maxTokens: 16384 });
+    const response = await chat(messages, { model, tools, maxTokens: 12288 });
 
     if (response.content) finalResponse = response.content;
     if (response.toolCalls.length === 0) break;
@@ -1266,18 +1232,6 @@ ${topGaps}
           console.log(`  [read_project] ${args.path?.slice(0, 60)}...`);
           result = readProjectFile(args.path ?? '');
           break;
-        case 'fetch_transcript':
-          console.log(`  [transcript] ${args.ticker ?? ticker} Q${args.quarter} ${args.year}`);
-          result = await fetchTranscript(String(args.ticker ?? ticker), Number(args.year), Number(args.quarter));
-          break;
-        case 'fetch_sec_xbrl':
-          console.log(`  [sec_xbrl] ${args.ticker ?? ticker} cik=${args.cik ?? 'auto'}`);
-          result = await fetchSecXbrl(String(args.ticker ?? ticker), args.cik ? String(args.cik) : undefined);
-          break;
-        case 'fetch_ir_press_release':
-          console.log(`  [ir_pr] ${args.ticker ?? ticker} Q${args.quarter} ${args.year}`);
-          result = await fetchIrPressRelease(String(args.ticker ?? ticker), Number(args.year), Number(args.quarter));
-          break;
         default:
           result = JSON.stringify({ error: `Unknown tool: ${tc.function.name}` });
       }
@@ -1312,9 +1266,6 @@ async function main() {
   const investorNote = args.why ?? args.note ?? '';
   const tag = args.tag ?? new Date().toISOString().slice(5, 10).replace('-', '');
 
-  // ── #6 補強：確保 git repo 存在（防止 "not a git repository" 錯誤）──
-  ensureGitRepo();
-
   console.log('╔══════════════════════════════════════╗');
   console.log('║       Initial MAX Runner             ║');
   console.log('╚══════════════════════════════════════╝');
@@ -1346,6 +1297,58 @@ async function main() {
   const skillContent = fs.readFileSync(skillPath, 'utf-8');
   const programPrompt = fs.existsSync(programPath) ? fs.readFileSync(programPath, 'utf-8') : '';
 
+  // ── Step 0: 強制預取金融數據（在 LLM 介入前，確保數值來自 API 而非訓練記憶）──
+  console.log('\n═══ Step 0: Pre-fetching Financial Data ═══');
+  const priceData = await fetchCurrentPrice(ticker);
+  if (priceData) {
+    console.log(`  ✓ 股價: $${priceData.price} (${priceData.date})`);
+  } else {
+    console.warn('  ⚠ 股價取得失敗（無 API key 或超限）— LLM 將使用訓練資料（不可靠）');
+  }
+
+  const xbrlData = await fetchSecXbrlMetrics(ticker);
+  if (xbrlData && xbrlData.length > 0) {
+    const latest = xbrlData[0];
+    const fcf = (latest.ocf ?? 0) - (latest.capex ?? 0);
+    console.log(`  ✓ SEC XBRL FY${latest.year}: OCF $${latest.ocf}M, CapEx $${latest.capex}M, FCF $${fcf}M, SBC $${latest.sbc}M`);
+    if (xbrlData.length > 1) {
+      const prior = xbrlData[1];
+      const priorFcf = (prior.ocf ?? 0) - (prior.capex ?? 0);
+      console.log(`    FY${prior.year}: OCF $${prior.ocf}M, CapEx $${prior.capex}M, FCF $${priorFcf}M`);
+    }
+  } else {
+    console.warn('  ⚠ SEC XBRL 數據取得失敗 — FCF/SBC 指標將無法注入報告');
+  }
+
+  // EPS 補充（非關鍵，失敗靜默）
+  if (xbrlData) {
+    try {
+      const epsRaw = await callNinjaApi('earnings_historical', { ticker });
+      const epsArr = JSON.parse(epsRaw);
+      if (Array.isArray(epsArr)) {
+        for (const row of epsArr) {
+          const yr = Number(row.fiscal_year ?? row.year ?? 0);
+          const eps = row.eps_actual ?? row.eps ?? null;
+          if (!yr || eps === null) continue;
+          const entry = xbrlData.find(d => d.year === yr);
+          if (entry) entry.eps = Number(eps);
+        }
+        console.log('  ✓ EPS 歷史已補入');
+      }
+    } catch { /* 靜默 */ }
+  }
+
+  if (priceData || xbrlData) {
+    const metrics = calculateValuationMetrics(priceData, xbrlData);
+    if (metrics) {
+      await injectMetricsHeader(ticker, metrics);
+      console.log('  ✓ 關鍵估值指標已注入報告頂部');
+      if (metrics.fcfPeg !== undefined)  console.log(`    FCF PEG: ${metrics.fcfPeg}  P/FCF: ${metrics.pFcf}x  FCF成長: ${metrics.fcfGrowthPct}%`);
+      if (metrics.peg   !== undefined)   console.log(`    PEG(EPS): ${metrics.peg}  P/E: ${metrics.pe}x  EPS成長: ${metrics.epsGrowthPct}%`);
+      if (metrics.fcfSbcM !== undefined) console.log(`    FCF-SBC: $${metrics.fcfSbcM}M  FCF-SBC Margin: ${metrics.fcfSbcMarginPct}%`);
+    }
+  }
+
   // Baseline score
   console.log('\n═══ Baseline Scoring ═══');
   const { score: baselineScore, gaps: baselineGaps } = await scoreCompanyResearch(ticker, 0, model);
@@ -1371,22 +1374,10 @@ async function main() {
     return;
   }
 
-  // ── #4 補強：plateau 判斷改為 3 輪 + rolling average 平滑噪音 ──
-  const PLATEAU_ROUNDS = 3;       // 連續幾輪無顯著提升才停止
-  const PLATEAU_MIN_DELTA = 2;    // 小於此分數視為「無顯著提升」
-
-  /** 取最近 N 筆有效分數（排除 LLM 失敗的 -1）的平均，供 plateau 比較用 */
-  function rollingAvg(scores: number[], n = 3): number {
-    const valid = scores.filter(s => s >= 0).slice(-n);
-    if (valid.length === 0) return 0;
-    return valid.reduce((a, b) => a + b, 0) / valid.length;
-  }
-
   // Main loop
   const history: RoundResult[] = [baselineResult];
   let prevScore = baselineScore.total;
   let plateauCount = 0;
-  const scoreHistory: number[] = [baselineScore.total]; // 用於 rolling avg
 
   for (let round = 1; round <= maxRounds; round++) {
     console.log(`\n═══ Round ${round}/${maxRounds} (current: ${prevScore}/100) ═══`);
@@ -1417,23 +1408,8 @@ async function main() {
       // Score new state
       console.log('Scoring...');
       const { score: newScore } = await scoreCompanyResearch(ticker, round, model);
-
-      // ── #4 補強：LLM scorer 失敗（total = -1）→ 跳過本輪 plateau 判斷，不更新 prevScore ──
-      if (newScore.total < 0) {
-        console.warn(`⚠ Round ${round}: LLM scorer returned invalid score, skipping plateau check.`);
-        const commitMsg = `initial-max r${round}: ${description.slice(0, 60)} — score N/A (scorer failed)`;
-        const commitHash = gitCommit(commitMsg);
-        history.push({ round, commit: commitHash, score: prevScore, status: 'no_improvement', description, timestamp: new Date().toISOString() });
-        appendTsv(tsvPath, history[history.length - 1]!);
-        continue;
-      }
-
-      const prevAvg = rollingAvg(scoreHistory);
-      scoreHistory.push(newScore.total);
-      const newAvg = rollingAvg(scoreHistory);
       const delta = newScore.total - prevScore;
-      const avgDelta = newAvg - prevAvg;
-      console.log(`Score: ${newScore.total}/100 (raw Δ${delta >= 0 ? '+' : ''}${delta} | rolling avg ${prevAvg.toFixed(1)}→${newAvg.toFixed(1)}, avgΔ${avgDelta >= 0 ? '+' : ''}${avgDelta.toFixed(1)})`);
+      console.log(`Score: ${newScore.total}/100 (${delta >= 0 ? '+' : ''}${delta} from ${prevScore})`);
 
       // Commit (always — research is additive)
       const commitMsg = `initial-max r${round}: ${description.slice(0, 60)} — score ${newScore.total}/100`;
@@ -1447,12 +1423,11 @@ async function main() {
       history.push(result);
       appendTsv(tsvPath, result);
 
-      // ── #4 補強：plateau 以 rolling avg delta < PLATEAU_MIN_DELTA 判斷，連續 PLATEAU_ROUNDS 輪才停 ──
-      if (avgDelta >= PLATEAU_MIN_DELTA) {
-        console.log(`✓ IMPROVED (avg Δ+${avgDelta.toFixed(1)})`);
+      if (delta > 0) {
+        console.log(`✓ IMPROVED by +${delta}`);
         plateauCount = 0;
       } else {
-        console.log(`→ Low avg improvement (avgΔ${avgDelta.toFixed(1)} < ${PLATEAU_MIN_DELTA}) — plateau count: ${plateauCount + 1}/${PLATEAU_ROUNDS}`);
+        console.log(`→ No improvement (plateau count: ${plateauCount + 1}/2)`);
         plateauCount++;
       }
 
@@ -1463,8 +1438,8 @@ async function main() {
         console.log(`\n✓ TARGET REACHED: ${newScore.total}/100 ≥ ${PASS_THRESHOLD}`);
         break;
       }
-      if (plateauCount >= PLATEAU_ROUNDS) {
-        console.log(`\n⚠ PLATEAU DETECTED: ${PLATEAU_ROUNDS} consecutive rounds with avg improvement < ${PLATEAU_MIN_DELTA}pts. Stopping.`);
+      if (plateauCount >= 2) {
+        console.log(`\n⚠ PLATEAU DETECTED: 2 consecutive rounds with no improvement. Stopping.`);
         break;
       }
 
@@ -1488,14 +1463,6 @@ async function main() {
 
   if (!skipPolish && fs.existsSync(mainFilePath) && ranAtLeastOneResearchRound) {
     console.log('\n═══ Polish pass（主檔順稿／格式整理，無新研究）═══');
-    // ── #3 補強：記錄 polish 前分數，事後比較；退步則回復 .bak ──
-    const scoreBeforePolish = prevScore;
-    const bakPath = mainFilePath + '.bak';
-    // 確保 .bak 是 polish 前的快照（writeResearchSection 已會建立，這裡補保險）
-    if (!fs.existsSync(bakPath)) {
-      fs.copyFileSync(mainFilePath, bakPath);
-      console.log(`  [polish] 備份快照已存至 ${ticker}_Initial_MAX.md.bak`);
-    }
     try {
       const polishGaps: InitialMaxGaps = { round: polishRoundId, score: prevScore, gaps: [] };
       const polishResp = await runGapFillAgent(
@@ -1516,38 +1483,18 @@ async function main() {
       console.log(`Polish summary: ${polishDesc}`);
       console.log('Scoring after polish...');
       const { score: afterPolish } = await scoreCompanyResearch(ticker, polishRoundId, model);
-      console.log(`Score after polish: ${afterPolish.total}/100 (before: ${scoreBeforePolish}/100)`);
-
-      // ── #3 補強：polish 後分數 < polish 前 → 回復 .bak，拒絕這次 polish ──
-      if (afterPolish.total < scoreBeforePolish) {
-        console.warn(`⚠ Polish REJECTED: score dropped ${scoreBeforePolish} → ${afterPolish.total}. Restoring from .bak...`);
-        if (fs.existsSync(bakPath)) {
-          fs.copyFileSync(bakPath, mainFilePath);
-          console.log(`  ✓ 已從 .bak 回復主檔，polish 結果丟棄。`);
-        }
-        history.push({
-          round: polishRoundId,
-          commit: gitShortHash(),
-          score: scoreBeforePolish,
-          status: 'no_improvement',
-          description: `polish rejected (score dropped ${scoreBeforePolish}→${afterPolish.total})`,
-          timestamp: new Date().toISOString(),
-        });
-        appendTsv(tsvPath, history[history.length - 1]!);
-      } else {
-        const commitHash = gitCommit(`initial-max polish: ${polishDesc.slice(0, 55)} — score ${afterPolish.total}/100`);
-        history.push({
-          round: polishRoundId,
-          commit: commitHash,
-          score: afterPolish.total,
-          status: 'keep',
-          description: polishDesc,
-          timestamp: new Date().toISOString(),
-        });
-        appendTsv(tsvPath, history[history.length - 1]!);
-        prevScore = afterPolish.total;
-        console.log(`✓ Polish accepted: ${scoreBeforePolish} → ${afterPolish.total}`);
-      }
+      console.log(`Score after polish: ${afterPolish.total}/100`);
+      const commitHash = gitCommit(`initial-max polish: ${polishDesc.slice(0, 55)} — score ${afterPolish.total}/100`);
+      history.push({
+        round: polishRoundId,
+        commit: commitHash,
+        score: afterPolish.total,
+        status: 'keep',
+        description: polishDesc,
+        timestamp: new Date().toISOString(),
+      });
+      appendTsv(tsvPath, history[history.length - 1]!);
+      prevScore = afterPolish.total;
     } catch (err: any) {
       console.error(`Polish pass CRASH: ${err.message}`);
       const crashResult: RoundResult = {
