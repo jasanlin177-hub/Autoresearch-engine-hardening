@@ -82,10 +82,17 @@ CEO 故事線必須涵蓋：學經歷背景、關鍵決策時刻、管理哲學�
 
 ---
 
+## 官方揭露優先原則
+
+**每輪研究開始前**，先確認 `official/` 子目錄是否已有資料（用 `list_company_files`）。若無，**立即呼叫 `fetch_official_disclosure(ticker)`**，抓取法說會簡報、財務報告、月營收等官方 PDF，存入 `official/` 子目錄後再開始填補缺口。官方數字的優先序高於媒體整理稿，取得後應以官方數字覆蓋主檔中的財務數據與管理層引言。
+
+---
+
 ## 搜尋策略（台股版）
 
 | 缺口類型 | 優先工具 | 搜尋模板 |
 |---------|---------|---------|
+| **官方揭露（首輪）** | **fetch_official_disclosure** | **法說會 / 財報 / 月營收 — 優先於所有搜尋** |
 | 財務數據 | fetch_url MOPS | mops.twse.com.tw 帶公司代號 |
 | 月營收 | fetch_url TWSE | twse.com.tw/rwd/zh/afterTrading/FMSRFK |
 | CEO 訪談 | web_search | "{CEO名} 訪談 商業周刊 OR 天下雜誌" |

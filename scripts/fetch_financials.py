@@ -10,7 +10,9 @@ Usage:
 """
 from __future__ import annotations
 import math
+import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 try:
@@ -19,6 +21,23 @@ try:
 except ImportError:
     HAS_YFINANCE = False
     print('[fetch_financials] yfinance not installed — pip install yfinance')
+
+
+def _init_yfinance_cache() -> None:
+    """Point yfinance cache at a writable local directory on Windows."""
+    if not HAS_YFINANCE:
+        return
+    try:
+        default_cache = Path(__file__).resolve().parents[1] / '.cache' / 'yfinance'
+        cache_dir = Path(os.getenv('YFINANCE_CACHE_DIR', str(default_cache)))
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        if hasattr(yf, 'set_tz_cache_location'):
+            yf.set_tz_cache_location(str(cache_dir))
+    except Exception as e:
+        print(f'[fetch_financials] cache init warning: {e}')
+
+
+_init_yfinance_cache()
 
 
 @dataclass
@@ -156,11 +175,67 @@ def fetch_financials(ticker: str, market: str = 'TWO') -> FinancialData:
     if mc:
         data.market_cap_b = mc / 1e8
 
-    # PEG ratio: prefer yfinance value, else compute
-    peg = _safe(info.get('pegRatio'))
-    if peg:
-        data.peg_ratio = peg
+    # ── EPS 成長率計算（三層優先順序）────────────────────────────────────────────
+    # 1. 優先：最近 4 季 NI vs 前 4 季 NI（興櫃只取 Q2/Q4 兩季比較）
+    # 2. 備用：最近年度 vs 前一年度（年報比較）
+    # 3. 最後：Yahoo Finance earningsGrowth（最不準，單季 YoY）
+    # GOODinfo 用年度 EPS 成長率，以此方法計算 PEG 與其一致。
+    computed_growth: float | None = None
+
+    try:
+        qi = t.quarterly_income_stmt
+        if qi is not None and not qi.empty and 'Net Income' in qi.index:
+            ni_row = qi.loc['Net Income']
+            # 取所有有效季度，按時間降序排列
+            all_q = sorted(
+                [(ts, _safe(v)) for ts, v in ni_row.items() if _safe(v) is not None],
+                reverse=True
+            )
+            # 篩出 Q2（6月）與 Q4（12月）─ 興櫃的申報季
+            q2q4 = [(ts, v) for ts, v in all_q if ts.month in (6, 12)]
+
+            if len(q2q4) >= 4:
+                # 最近 Q2+Q4 vs 前一年 Q2+Q4
+                recent = q2q4[0][1] + q2q4[1][1]
+                prior  = q2q4[2][1] + q2q4[3][1]
+                if prior > 0:
+                    computed_growth = (recent - prior) / prior
+                    data._growth_method = 'Q2+Q4 YoY'
+            elif len(all_q) >= 8:
+                # 足夠 8 季 → 滾動 TTM vs 前年 TTM
+                recent_ttm = sum(v for _, v in all_q[:4])
+                prior_ttm  = sum(v for _, v in all_q[4:8])
+                if prior_ttm > 0:
+                    computed_growth = (recent_ttm - prior_ttm) / prior_ttm
+                    data._growth_method = 'TTM YoY'
+    except Exception:
+        pass
+
+    # 備用：年度報表比較
+    if computed_growth is None:
+        try:
+            ai = t.income_stmt
+            if ai is not None and not ai.empty and 'Net Income' in ai.index:
+                ni = ai.loc['Net Income']
+                cols = sorted(
+                    [c for c in ni.index if _safe(ni[c]) is not None],
+                    reverse=True
+                )
+                if len(cols) >= 2:
+                    ni_new = _safe(ni[cols[0]])
+                    ni_old = _safe(ni[cols[1]])
+                    if ni_old and ni_old > 0 and ni_new:
+                        computed_growth = (ni_new - ni_old) / abs(ni_old)
+                        data._growth_method = 'Annual YoY'
+        except Exception:
+            pass
+
+    if computed_growth and computed_growth > 0:
+        data.earnings_growth = computed_growth
+        if data.trailing_pe:
+            data.peg_ratio = data.trailing_pe / (computed_growth * 100)
     elif data.trailing_pe and data.earnings_growth and data.earnings_growth > 0:
+        # 最後備用：Yahoo 原始 earningsGrowth（單季 YoY，較不準）
         data.peg_ratio = data.trailing_pe / (data.earnings_growth * 100)
 
     # Total revenue in 億

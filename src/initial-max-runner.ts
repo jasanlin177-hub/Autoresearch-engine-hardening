@@ -194,6 +194,22 @@ async function fetchUrl(url: string): Promise<string> {
   }
 }
 
+async function fetchOfficialDisclosureTool(ticker: string, types?: string[]): Promise<string> {
+  const { fetchOfficialDisclosure } = await import('./mops.js');
+  const docs = await fetchOfficialDisclosure(ticker, types as any);
+  if (!docs.length) return JSON.stringify({ status: 'no_docs', ticker });
+  for (const doc of docs) {
+    const safeName = doc.date.replace(/\//g, '') || 'unknown';
+    const filename = `official/${doc.type}_${safeName}.md`;
+    writeResearchSection(ticker, filename, `# ${doc.title}\n\n${doc.text}`, 'overwrite');
+  }
+  return JSON.stringify({
+    status: 'fetched',
+    ticker,
+    docs: docs.map(d => ({ type: d.type, title: d.title, chars: d.chars })),
+  });
+}
+
 /** 找到主檔中對應 section_anchor 的小節起訖（含標題行；訖為下一小節前一行）。 */
 function findSectionRange(lines: string[], sectionAnchor: string): [number, number] | null {
   const anchorNum = sectionAnchor.trim();
@@ -694,6 +710,25 @@ const GAP_FILL_TOOLS: ToolDef[] = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'fetch_official_disclosure',
+      description: '從公開資訊觀測站(MOPS)下載官方揭露文件並解析為文字。優先抓法說會簡報(conference)，其次財報(financial)、年報(annual)、月營收(revenue)。抓到後自動存入 official/ 子目錄，可用 read_research_file 讀取。**首輪若 official/ 無資料，請優先呼叫此工具建立官方數字基準，再用官方數字覆蓋媒體整理稿。**',
+      parameters: {
+        type: 'object',
+        properties: {
+          ticker: { type: 'string', description: '股票代號，例如 "7740"' },
+          types: {
+            type: 'array',
+            items: { type: 'string', enum: ['conference', 'financial', 'annual', 'revenue'] },
+            description: '指定文件類型；不填則依預設序 conference > financial > revenue 全部抓取',
+          },
+        },
+        required: ['ticker'],
+      },
+    },
+  },
 ];
 
 /** 整理輪：僅讀寫主檔，禁止任何新資料蒐集 */
@@ -881,6 +916,10 @@ ${topGaps}
         case 'read_project_file':
           console.log(`  [read_project] ${args.path?.slice(0, 60)}...`);
           result = readProjectFile(args.path ?? '');
+          break;
+        case 'fetch_official_disclosure':
+          console.log(`  [mops] ${args.ticker ?? ticker} types=${JSON.stringify(args.types ?? [])}`);
+          result = await fetchOfficialDisclosureTool(args.ticker ?? ticker, args.types);
           break;
         default:
           result = JSON.stringify({ error: `Unknown tool: ${tc.function.name}` });

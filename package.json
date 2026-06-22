@@ -7,11 +7,17 @@
     "initial-max": "tsx src/initial-max-runner.ts",
     "score": "tsx src/initial-max-scorer.ts",
     "tw-research": "tsx src/initial-max-runner.ts --market TW",
-    "tw-score": "tsx src/initial-max-scorer.ts --market TW"
+    "tw-score": "tsx src/initial-max-scorer.ts --market TW",
+    "test-llm": "tsx src/test-llm-layers.ts",
+    "update-market-snapshot": "powershell -Command \"$env:NODE_OPTIONS='--use-system-ca'; node scripts/update_market_snapshot.mjs 7740\""
   },
   "devDependencies": {
     "@types/node": "^24.10.1",
     "tsx": "^4.19.0",
     "typescript": "~5.9.3"
+  },
+  "dependencies": {
+    "pdf-parse": "^2.4.5",
+    "playwright": "^1.60.0"
   }
 }

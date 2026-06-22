@@ -59,12 +59,14 @@ function toGoogleModel(model: string): string {
   const bare = model.replace(/^google\//, '');
   // Known mappings
   const MAP: Record<string, string> = {
-    'gemini-3.1-pro-preview':  'gemini-2.5-pro-preview-05-06',
-    'gemini-3.1-flash-preview': 'gemini-2.0-flash',
-    'gemini-2.5-pro-preview':  'gemini-2.5-pro-preview-05-06',
-    'gemini-2.5-flash-preview': 'gemini-2.5-flash-preview-04-17',
+    'gemini-3.1-pro-preview':  'gemini-3.1-pro-preview',
+    'gemini-3.1-flash-preview': 'gemini-3.1-flash-lite',
+    'gemini-2.5-pro-preview':  'gemini-2.5-pro',
+    'gemini-2.5-flash-preview': 'gemini-2.5-flash',
+    'gemini-2.5-flash-preview-05-20': 'gemini-2.5-flash',
+    'gemini-2.5-pro-preview-05-06': 'gemini-2.5-pro',
     'gemini-2.0-flash':        'gemini-2.0-flash',
-    'gemini-2.0-pro':          'gemini-2.0-pro',
+    'gemini-2.0-pro':          'gemini-pro-latest',
     'gemini-1.5-pro':          'gemini-1.5-pro',
     'gemini-1.5-flash':        'gemini-1.5-flash',
   };
@@ -246,9 +248,10 @@ export async function chat(
   // If the requested model is a heavy Pro model, downgrade to Flash for paid tier
   // to avoid burning budget. Pro quality is only cost-justified via free Google Studio quota.
   const PAID_DOWNGRADE: Record<string, string> = {
-    'google/gemini-3.1-pro-preview':  'google/gemini-2.5-flash-preview-05-20',
-    'google/gemini-2.5-pro-preview':  'google/gemini-2.5-flash-preview-05-20',
+    'google/gemini-3.1-pro-preview':  'google/gemini-2.5-flash',
+    'google/gemini-2.5-pro-preview':  'google/gemini-2.5-flash',
     'google/gemini-3.1-flash-preview': 'google/gemini-2.0-flash',
+    'google/gemini-2.5-pro-preview-05-06': 'google/gemini-2.5-flash',
   };
   const paidModel = PAID_DOWNGRADE[requestedModel] ?? requestedModel;
   if (paidModel !== requestedModel) {
