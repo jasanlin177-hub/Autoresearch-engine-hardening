@@ -159,7 +159,7 @@ def deduplicate_sections(text):
 
 
 # ── PDF Builder ───────────────────────────────────────────────────────────────
-def build_pdf(md_path, out_path):
+def build_pdf(md_path, out_path, ticker=None, company_name=None, market="TWO"):
     with open(md_path, encoding="utf-8") as f:
         raw = f.read()
 
@@ -170,7 +170,9 @@ def build_pdf(md_path, out_path):
     W, H = A4
     margin = 20 * mm
 
-    company      = "東聯互動（7738）深度研究報告"
+    _ticker = ticker or '7738'
+    _company = company_name or f"（{_ticker}）深度研究報告"
+    company      = f"{_company}（{_ticker}）深度研究報告"
     report_date  = datetime.today().strftime("%Y-%m-%d")
     CONTENT_W    = W - 2 * margin   # usable content width
 
@@ -179,7 +181,7 @@ def build_pdf(md_path, out_path):
     if HAS_FINANCIALS:
         try:
             print('  [cover] Fetching financial data…')
-            fin = fetch_financials('7738', 'TWO')
+            fin = fetch_financials(_ticker, market)
             print(f'  [cover] 股價 {fin.fmt_price()}  市值 {fin.fmt_mktcap()}')
         except Exception as e:
             print(f'  [cover] Financial fetch failed: {e}')
@@ -241,8 +243,8 @@ def build_pdf(md_path, out_path):
     # ── Cover header table (dark-navy background, full width) ─────────────────
     hdr_rows = [
         [Paragraph('', s_disc)],                          # top pad
-        [Paragraph(f'股票代號　7738　｜　{market_str}', s_ticker)],
-        [Paragraph('東聯互動', s_company)],
+        [Paragraph(f'股票代號　{_ticker}　｜　{market_str}', s_ticker)],
+        [Paragraph(_company, s_company)],
         [Paragraph('深度研究報告', s_subtitle)],
         [Paragraph(f'目前股價：{price_str}　｜　市值：{mktcap_str}', s_info)],
         [Paragraph(f'產業：{sector_str}　｜　產出日期：{report_date}', s_info)],
@@ -480,6 +482,13 @@ def build_pdf(md_path, out_path):
 
 
 if __name__ == "__main__":
-    md = r"C:\Users\機動小隊\TaiEquityautoresearch\data\companies\7738\7738_Initial_MAX.md"
-    out = r"C:\Users\機動小隊\TaiEquityautoresearch\data\companies\7738\7738_Report.pdf"
-    build_pdf(md, out)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--ticker', default='7738')
+    parser.add_argument('--company', default=None)
+    parser.add_argument('--market', default='TWO')
+    args = parser.parse_args()
+    base = rf"C:\Users\機動小隊\TaiEquityautoresearch\data\companies\{args.ticker}"
+    md  = rf"{base}\{args.ticker}_Initial_MAX.md"
+    out = rf"{base}\{args.ticker}_Report.pdf"
+    build_pdf(md, out, ticker=args.ticker, company_name=args.company, market=args.market)

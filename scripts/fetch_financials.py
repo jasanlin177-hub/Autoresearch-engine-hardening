@@ -23,6 +23,50 @@ except ImportError:
     print('[fetch_financials] yfinance not installed — pip install yfinance')
 
 
+def _init_ca_bundle() -> None:
+    """
+    Make yfinance/curl_cffi trust SSL-intercepted connections (e.g. Norton /
+    ESET / corporate proxy doing TLS scanning) by merging the Windows
+    certificate store roots into certifi's bundle and pointing the HTTP
+    clients at the combined file via env vars.
+
+    Without this, curl_cffi fails with:
+        curl: (60) SSL certificate problem: unable to get local issuer certificate
+    because the interceptor's root CA lives only in the Windows store, not in certifi.
+    """
+    import ssl
+    # ssl.enum_certificates is Windows-only; harmless no-op elsewhere.
+    if not hasattr(ssl, 'enum_certificates'):
+        return
+    try:
+        import certifi
+        cache_dir = Path(__file__).resolve().parents[1] / '.cache'
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        bundle = cache_dir / 'win-ca-bundle.pem'
+
+        pem_parts = []
+        for store in ('ROOT', 'CA'):
+            try:
+                for cert_bytes, enc, _trust in ssl.enum_certificates(store):
+                    if enc == 'x509_asn':
+                        pem_parts.append(ssl.DER_cert_to_PEM_cert(cert_bytes))
+            except Exception:
+                continue
+
+        if pem_parts:
+            bundle.write_text(
+                certifi.contents() + '\n' + '\n'.join(pem_parts),
+                encoding='utf-8',
+            )
+            # curl_cffi honours CURL_CA_BUNDLE; requests honours REQUESTS_CA_BUNDLE;
+            # stdlib ssl honours SSL_CERT_FILE.
+            os.environ['CURL_CA_BUNDLE']     = str(bundle)
+            os.environ['REQUESTS_CA_BUNDLE'] = str(bundle)
+            os.environ.setdefault('SSL_CERT_FILE', str(bundle))
+    except Exception as e:
+        print(f'[fetch_financials] CA bundle init warning: {e}')
+
+
 def _init_yfinance_cache() -> None:
     """Point yfinance cache at a writable local directory on Windows."""
     if not HAS_YFINANCE:
@@ -37,6 +81,7 @@ def _init_yfinance_cache() -> None:
         print(f'[fetch_financials] cache init warning: {e}')
 
 
+_init_ca_bundle()
 _init_yfinance_cache()
 
 

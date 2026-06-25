@@ -948,9 +948,11 @@ async function main() {
     process.exit(1);
   }
 
-  const maxRounds = parseInt(args['max-rounds'] ?? String(DEFAULT_MAX_ROUNDS), 10);
+  const maxRounds = parseInt(args['max-rounds'] ?? args['rounds'] ?? String(DEFAULT_MAX_ROUNDS), 10);
+  const noPlateau = args['no-plateau'] === 'true';
   const scoreOnly = args['score-only'] === 'true';
   const skipPolish = args['skip-polish'] === 'true';
+  const force = args['force'] === 'true';
   const model = args.model ?? DEFAULT_MODEL;
   const market = args.market ?? 'US';
   const investorNote = args.why ?? args.note ?? '';
@@ -1009,10 +1011,14 @@ async function main() {
     return;
   }
 
-  if (baselineScore.passThreshold) {
+  if (baselineScore.passThreshold && !force) {
     console.log(`\n✓ Already at ${baselineScore.total}/100 — threshold met. No further research needed.`);
+    console.log(`  (Use --force to continue researching anyway)`);
     cleanupTickerScoreAndGapsFiles(ticker);
     return;
+  }
+  if (baselineScore.passThreshold && force) {
+    console.log(`\n→ Threshold already met (${baselineScore.total}/100) but --force set — continuing research.`);
   }
 
   // Main loop
@@ -1079,9 +1085,12 @@ async function main() {
         console.log(`\n✓ TARGET REACHED: ${newScore.total}/100 ≥ ${PASS_THRESHOLD}`);
         break;
       }
-      if (plateauCount >= 2) {
+      if (plateauCount >= 2 && !noPlateau) {
         console.log(`\n⚠ PLATEAU DETECTED: 2 consecutive rounds with no improvement. Stopping.`);
         break;
+      }
+      if (plateauCount >= 2 && noPlateau) {
+        console.log(`→ Plateau reached but --no-plateau set, continuing…`);
       }
 
       const elapsed = ((Date.now() - roundStart) / 1000).toFixed(1);

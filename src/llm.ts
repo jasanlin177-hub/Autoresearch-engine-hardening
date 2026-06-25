@@ -180,39 +180,51 @@ export async function chat(
     maxTokens?: number;
   },
 ): Promise<ChatResult> {
-  const requestedModel = options?.model ?? 'google/gemini-3.1-pro-preview';
+  const requestedModel = options?.model ?? 'google/gemini-2.5-flash';
   const opts = {
     tools: options?.tools,
     toolChoice: options?.toolChoice,
     maxTokens: options?.maxTokens,
   };
 
-  // ── Try Google AI Studio first (if key is set and model is a Google model) ──
+  // ── Try Google AI Studio first (with retry on 429 rate limit) ──
+  // PRO account has higher quotas — retry up to 3× with 35s backoff before giving up.
   if (GOOGLE_STUDIO_KEY && isGoogleModel(requestedModel)) {
     const googleModel = toGoogleModel(requestedModel);
-    try {
-      const result = await callEndpoint(
-        GOOGLE_STUDIO_URL, GOOGLE_STUDIO_KEY, googleModel,
-        messages, opts, GOOGLE_TIMEOUT_MS,
-      );
-      console.log(`  [llm] Google AI Studio (${googleModel}) ✓`);
-      return { ...result, provider: 'google-studio' };
-    } catch (err: any) {
-      const msg: string = err.message ?? '';
-      const is429  = msg.includes('429') || msg.toLowerCase().includes('quota') || msg.toLowerCase().includes('rate');
-      const isTimeout = msg.toLowerCase().includes('timeout');
-      if (is429) {
-        console.warn(`  [llm] Google AI Studio quota exceeded → falling back to OpenRouter`);
-      } else if (isTimeout) {
-        console.warn(`  [llm] Google AI Studio timed out (${GOOGLE_TIMEOUT_MS / 1000}s) → falling back to OpenRouter`);
-      } else {
-        console.warn(`  [llm] Google AI Studio error: ${msg.slice(0, 120)} → falling back to OpenRouter`);
+    const MAX_RETRIES = 3;
+    const RETRY_DELAY_MS = 35_000;
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const result = await callEndpoint(
+          GOOGLE_STUDIO_URL, GOOGLE_STUDIO_KEY, googleModel,
+          messages, opts, GOOGLE_TIMEOUT_MS,
+        );
+        console.log(`  [llm] Google AI Studio (${googleModel}) ✓`);
+        return { ...result, provider: 'google-studio' };
+      } catch (err: any) {
+        const msg: string = err.message ?? '';
+        const is429  = msg.includes('429') || msg.toLowerCase().includes('quota') || msg.toLowerCase().includes('rate');
+        const isTimeout = msg.toLowerCase().includes('timeout');
+        if (is429 && attempt < MAX_RETRIES) {
+          console.warn(`  [llm] Google AI Studio rate limit (attempt ${attempt}/${MAX_RETRIES}) → waiting ${RETRY_DELAY_MS / 1000}s before retry…`);
+          await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
+          continue;
+        } else if (is429) {
+          console.warn(`  [llm] Google AI Studio rate limit after ${MAX_RETRIES} attempts → falling back to OpenRouter`);
+        } else if (isTimeout) {
+          console.warn(`  [llm] Google AI Studio timed out (${GOOGLE_TIMEOUT_MS / 1000}s) → falling back to OpenRouter`);
+        } else {
+          console.warn(`  [llm] Google AI Studio error: ${msg.slice(0, 120)} → falling back to OpenRouter`);
+        }
+        break;
       }
     }
   }
 
-  // ── Fallback: OpenRouter 免費模型（無需餘額）──
-  if (OPENROUTER_KEY) {
+  // ── Fallback: OpenRouter 免費模型（僅在 Google 模型路徑下嘗試）──
+  // 若使用者明確指定非 Google 模型（如 anthropic/claude-*），直接走付費，跳過免費層
+  const useFreeTier = isGoogleModel(requestedModel);
+  if (OPENROUTER_KEY && useFreeTier) {
     for (const freeModel of FREE_MODELS) {
       try {
         const result = await callEndpoint(

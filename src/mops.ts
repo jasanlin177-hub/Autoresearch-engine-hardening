@@ -1,7 +1,8 @@
-import { chromium } from 'playwright';
-import { createRequire } from 'module';
-const _require = createRequire(import.meta.url);
-const pdfParse = _require('pdf-parse') as (buf: Buffer) => Promise<{ text: string; numpages: number }>;
+// MOPS 公開資訊觀測站 — 官方財報 / 月營收 / 法說會抓取
+//
+// 改版說明：MOPS 舊頁面的 co_id 已改為隱藏欄位，Playwright 無法 .fill() 隱藏欄位
+// （locator timeout）。改用直接 POST 到 ajax_* 端點，回傳 HTML 表格，免瀏覽器、
+// 更快也更穩定。端點與參數於 2026-06 驗證可用。
 
 const MOPS = 'https://mopsov.twse.com.tw';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -15,141 +16,157 @@ export interface OfficialDoc {
   chars: number;
 }
 
-async function parsePdf(url: string): Promise<string> {
-  const res = await fetch(url, { headers: { 'User-Agent': UA, Referer: MOPS } });
+/** POST 到 MOPS ajax 端點，回傳原始 HTML。 */
+async function mopsPost(endpoint: string, params: Record<string, string>): Promise<string> {
+  const body = new URLSearchParams({
+    encodeURIComponent: '1',
+    step: '1',
+    firstin: '1',
+    off: '1',
+    TYPEK: 'all',
+    isnew: 'false',
+    ...params,
+  });
+  const res = await fetch(`${MOPS}/mops/web/${endpoint}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'User-Agent': UA,
+      Referer: `${MOPS}/`,
+    },
+    body,
+  });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const buf = Buffer.from(await res.arrayBuffer());
-  const parsed = await pdfParse(buf);
-  return parsed.text;
+  return await res.text();
 }
 
-async function submitMopsForm(url: string, ticker: string, extraFields?: Record<string, string>): Promise<{ links: { url: string; date: string }[]; tableText: string }> {
-  const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
-  try {
-    const page = await browser.newPage();
-    await page.setExtraHTTPHeaders({ 'User-Agent': UA });
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
-
-    const coIdInput = page.locator('input[name="co_id"]').first();
-    if (await coIdInput.count()) await coIdInput.fill(ticker);
-
-    if (extraFields) {
-      for (const [name, value] of Object.entries(extraFields)) {
-        const el = page.locator(`input[name="${name}"], select[name="${name}"]`).first();
-        if (await el.count()) await el.fill(value);
-      }
-    }
-
-    // Submit and wait for AJAX
-    await page.keyboard.press('Enter');
-    await page.waitForTimeout(4000);
-
-    const links = await page.$$eval('a[href*="/nas/"]', anchors =>
-      (anchors as HTMLAnchorElement[])
-        .filter(a => /\.pdf$/i.test(a.href))
-        .map(a => {
-          const row = a.closest('tr');
-          const cells = row ? Array.from(row.querySelectorAll('td, th')) : [];
-          const dateCell = cells.find(c => /\d{3}\/\d{2}\/\d{2}/.test(c.textContent || ''));
-          const rocDate = dateCell?.textContent?.trim().match(/\d{3}\/\d{2}\/\d{2}/)?.[0] || '';
-          return { url: a.href, date: rocDate };
-        })
-    );
-
-    const tableText = await page.evaluate(() =>
-      Array.from(document.querySelectorAll('table'))
-        .map(t => (t as HTMLElement).innerText)
-        .join('\n\n')
-        .slice(0, 30000)
-    );
-
-    await page.close();
-    return { links, tableText };
-  } finally {
-    await browser.close();
-  }
+/** 將 MOPS HTML 表格轉成乾淨純文字。 */
+function htmlToText(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\s*\n\s*/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
+const thisRocYear = (): number => new Date().getFullYear() - 1911;
+
+/** 財報是否真的有資料（避免「查無資料」空殼）。 */
+function looksLikeFinancials(text: string): boolean {
+  return text.length > 600 && /(資產總額|營業收入|負債總額|本期淨利)/.test(text);
+}
+
+/** 法說會資訊（含日期、地點、擇要訊息）。 */
 async function fetchConferenceDocs(ticker: string): Promise<OfficialDoc[]> {
-  const { links } = await submitMopsForm(`${MOPS}/mops/web/t100sb07_1`, ticker);
-  const conferencePdfs = links.filter(l => /M001\.pdf|E001\.pdf/i.test(l.url));
-
-  const docs: OfficialDoc[] = [];
-  for (const link of conferencePdfs.slice(0, 3)) {
+  const roc = thisRocYear();
+  // 嘗試今年與去年，取有資料者
+  for (const year of [roc, roc - 1]) {
     try {
-      const text = await parsePdf(link.url);
-      if (text.trim().length > 200) {
-        docs.push({
-          type: 'conference',
-          title: `法說會簡報 ${link.date}`,
-          date: link.date,
-          url: link.url,
-          text: text.slice(0, 50000),
-          chars: text.length,
-        });
-      }
-    } catch (e: any) {
-      console.error(`[mops] conference PDF failed: ${link.url} — ${e.message}`);
-    }
-  }
-  return docs;
-}
-
-async function fetchFinancialDocs(ticker: string): Promise<OfficialDoc[]> {
-  const rocYear = String(new Date().getFullYear() - 1911);
-  const { links, tableText } = await submitMopsForm(
-    `${MOPS}/mops/web/t164sb03`,
-    ticker,
-    { year: rocYear, season: '4' },
-  );
-
-  for (const link of links.slice(0, 3)) {
-    try {
-      const text = await parsePdf(link.url);
-      if (text.trim().length > 200) {
+      const html = await mopsPost('ajax_t100sb07_1', { co_id: ticker, year: String(year) });
+      const text = htmlToText(html);
+      if (text.length > 200 && /法人說明會|法說會/.test(text)) {
+        const dateMatch = text.match(/\d{3}\/\d{2}\/\d{2}/);
         return [{
-          type: 'financial',
-          title: `財務報告 ${rocYear}`,
-          date: rocYear,
-          url: link.url,
+          type: 'conference',
+          title: `法人說明會資訊（民國 ${year} 年）`,
+          date: dateMatch?.[0] || String(year),
+          url: `${MOPS}/mops/web/t100sb07_1`,
           text: text.slice(0, 50000),
           chars: text.length,
         }];
       }
     } catch (e: any) {
-      console.error(`[mops] financial PDF failed: ${link.url} — ${e.message}`);
+      console.error(`[mops] conference ${year} failed for ${ticker}: ${e.message}`);
     }
-  }
-
-  if (tableText.trim().length > 200) {
-    return [{
-      type: 'financial',
-      title: `財務報告摘要 ${rocYear}`,
-      date: rocYear,
-      url: `${MOPS}/mops/web/t164sb03`,
-      text: tableText,
-      chars: tableText.length,
-    }];
   }
   return [];
 }
 
-async function fetchRevenueDocs(ticker: string): Promise<OfficialDoc[]> {
-  const rocYear = String(new Date().getFullYear() - 1911);
-  const { tableText } = await submitMopsForm(
-    `${MOPS}/mops/web/t05st10_ifrs`,
-    ticker,
-    { yy: rocYear },
-  );
+/** 合併資產負債表 + 合併綜合損益表（年報 / 第四季）。 */
+async function fetchFinancialDocs(ticker: string): Promise<OfficialDoc[]> {
+  const roc = thisRocYear();
+  // 試最近兩個會計年度的年報（第 4 季），取第一個有資料者
+  const candidates: Array<[number, string]> = [
+    [roc - 1, '04'],
+    [roc - 2, '04'],
+  ];
 
-  if (tableText.trim().length < 100) return [];
+  for (const [year, season] of candidates) {
+    try {
+      const [balanceHtml, incomeHtml] = await Promise.all([
+        mopsPost('ajax_t164sb03', { co_id: ticker, year: String(year), season }),
+        mopsPost('ajax_t164sb04', { co_id: ticker, year: String(year), season }),
+      ]);
+      const balance = htmlToText(balanceHtml);
+      const income = htmlToText(incomeHtml);
+      const combined = `【合併資產負債表】\n${balance}\n\n【合併綜合損益表】\n${income}`;
+
+      if (looksLikeFinancials(balance) || looksLikeFinancials(income)) {
+        return [{
+          type: 'financial',
+          title: `合併財務報表（民國 ${year} 年第 ${parseInt(season, 10)} 季 / 年報）`,
+          date: `${year}Q${parseInt(season, 10)}`,
+          url: `${MOPS}/mops/web/t164sb03`,
+          text: combined.slice(0, 80000),
+          chars: combined.length,
+        }];
+      }
+    } catch (e: any) {
+      console.error(`[mops] financial ${year}Q${season} failed for ${ticker}: ${e.message}`);
+    }
+  }
+  return [];
+}
+
+/** 近 12 個月月營收趨勢（每月一個 POST，組成趨勢表）。 */
+async function fetchRevenueDocs(ticker: string): Promise<OfficialDoc[]> {
+  const now = new Date();
+  // 最新已申報月份：每月 10 號前申報上月，保守從「上上月」往前抓
+  let y = now.getFullYear();
+  let m = now.getMonth() + 1 - 2; // JS month 0-based → 上上月
+  if (m <= 0) { m += 12; y -= 1; }
+
+  const lines: string[] = [];
+  let latestDate = '';
+  for (let i = 0; i < 12; i++) {
+    const roc = y - 1911;
+    const mm = String(m).padStart(2, '0');
+    try {
+      const html = await mopsPost('ajax_t05st10_ifrs', {
+        co_id: ticker, year: String(roc), month: mm,
+      });
+      const text = htmlToText(html);
+      const revMatch = text.match(/本月\s*([\d,]+)/);
+      const yoyMatch = text.match(/增減百分比\s*([\-\d,.]+)/);
+      if (revMatch) {
+        if (!latestDate) latestDate = `${roc}/${mm}`;
+        const yoy = yoyMatch ? `（YoY ${yoyMatch[1]}%）` : '';
+        lines.push(`民國 ${roc} 年 ${mm} 月：營收 ${revMatch[1]} 仟元 ${yoy}`);
+      }
+    } catch {
+      // 跳過抓不到的月份
+    }
+    m -= 1;
+    if (m <= 0) { m = 12; y -= 1; }
+  }
+
+  if (!lines.length) return [];
+  const text = `【近 12 個月月營收趨勢】（來源：公開資訊觀測站 / 單位：新台幣仟元）\n` + lines.join('\n');
   return [{
     type: 'revenue',
-    title: `月營收 ${rocYear}`,
-    date: rocYear,
+    title: '月營收趨勢（近 12 個月）',
+    date: latestDate,
     url: `${MOPS}/mops/web/t05st10_ifrs`,
-    text: tableText,
-    chars: tableText.length,
+    text,
+    chars: text.length,
   }];
 }
 
@@ -169,7 +186,7 @@ export async function fetchOfficialDisclosure(
         case 'revenue':    docs = await fetchRevenueDocs(ticker); break;
       }
       results.push(...docs);
-      if (docs.length) console.log(`[mops] ${type}: ${docs.length} doc(s) for ${ticker}`);
+      if (docs.length) console.log(`[mops] ${type}: ${docs.length} doc(s), ${docs[0].chars} chars for ${ticker}`);
       else console.log(`[mops] ${type}: no docs found for ${ticker}`);
     } catch (e: any) {
       console.error(`[mops] ${type} failed for ${ticker}:`, e.message);
