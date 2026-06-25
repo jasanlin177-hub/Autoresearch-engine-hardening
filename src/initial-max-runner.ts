@@ -26,7 +26,7 @@ import { scoreCompanyResearch, type InitialMaxScore, type InitialMaxGaps } from 
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '..');
-const DEFAULT_MODEL = 'google/gemini-3.1-pro-preview';
+const DEFAULT_MODEL = 'google/gemini-2.5-flash';
 const DEFAULT_MAX_ROUNDS = 20;
 const PASS_THRESHOLD = 95;
 /** 每輪 gap-fill user 訊息附加主檔全文之上限（極長檔仍可能截斷，見訊息內說明） */
