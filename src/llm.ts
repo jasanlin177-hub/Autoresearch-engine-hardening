@@ -112,7 +112,7 @@ async function callEndpoint(
   apiKey: string,
   model: string,
   messages: Message[],
-  options: { tools?: ToolDef[]; toolChoice?: 'auto' | 'none'; maxTokens?: number },
+  options: { tools?: ToolDef[]; toolChoice?: 'auto' | 'none'; maxTokens?: number; temperature?: number },
   timeoutMs?: number,
 ): Promise<ChatResult> {
   const body: Record<string, unknown> = {
@@ -121,6 +121,7 @@ async function callEndpoint(
     max_tokens: options.maxTokens ?? 16384,
     stream: false,
   };
+  if (options.temperature !== undefined) body.temperature = options.temperature;
 
   if (options.tools?.length) {
     body.tools = options.tools;
@@ -182,6 +183,7 @@ export async function chat(
     // 評分等「品質敏感」呼叫應設 true：免費模型會回傳「可解析但垃圾」的結果，
     // 比直接失敗更糟（會被當成有效分數採用）。改走 heuristic / 付費層較安全。
     noFreeTier?: boolean;
+    temperature?: number;
   },
 ): Promise<ChatResult> {
   const requestedModel = options?.model ?? 'google/gemini-2.5-flash';
@@ -189,6 +191,7 @@ export async function chat(
     tools: options?.tools,
     toolChoice: options?.toolChoice,
     maxTokens: options?.maxTokens,
+    temperature: options?.temperature,
   };
 
   // ── Try Google AI Studio first (with retry on 429 rate limit) ──

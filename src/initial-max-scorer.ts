@@ -393,11 +393,11 @@ ${reportContent.slice(0, 80000)}`;
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userMessage },
       ],
-      // noFreeTier：評分絕不可用免費模型。Gemma/Nemotron 會回「可解析但垃圾」的分數
-      // （如組織維度直接給 0），被當成有效分數採用，比 LLM 失敗走 heuristic 更糟。
-      // maxTokens 12000：Gemini 2.5 Flash thinking mode 的 thinking token 佔用輸出預算，
-      // 4096 不夠同時放 thinking + JSON，會造成 content 截斷為 null。
-      { model, maxTokens: 12000, noFreeTier: true },
+      // noFreeTier：評分絕不可用免費模型。
+      // maxTokens 12000：Gemini 2.5 Flash thinking token 佔用輸出預算，需留空間給 JSON。
+      // temperature 0：評分需要確定性輸出；預設 temperature=1 造成同份報告分數
+      //   隨機波動（實測：同檔案 56→19.8→56，環境維度 19→4→17）。
+      { model, maxTokens: 12000, noFreeTier: true, temperature: 0 },
     );
 
     if (!response.content) {
