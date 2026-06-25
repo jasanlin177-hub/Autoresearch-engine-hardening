@@ -10,7 +10,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { chat } from './llm.js';
+import { chat, geminiGenerateContent } from './llm.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '..');
@@ -388,27 +388,33 @@ async function llmScore(
 ${reportContent.slice(0, 80000)}`;
 
   try {
-    const response = await chat(
-      [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userMessage },
-      ],
-      // noFreeTier：評分絕不可用免費模型。
-      // maxTokens 12000：Gemini 2.5 Flash thinking token 佔用輸出預算，需留空間給 JSON。
-      // temperature 0：評分需要確定性輸出；預設 temperature=1 造成同份報告分數
-      //   隨機波動（實測：同檔案 56→19.8→56，環境維度 19→4→17）。
-      { model, maxTokens: 12000, noFreeTier: true, temperature: 0 },
-    );
+    let rawText: string | null;
+    const isGoogle = model.startsWith('google/') || model.startsWith('gemini-');
 
-    if (!response.content) {
-      console.warn('[scorer] LLM returned null/empty content (likely thinking-budget exhausted)');
+    if (isGoogle) {
+      // Use native Gemini generateContent with thinkingBudget=0.
+      // The OpenAI-compat endpoint does NOT support thinking_config → 400 error.
+      // Native endpoint supports thinkingConfig and filters out thought parts automatically.
+      rawText = await geminiGenerateContent(model, systemPrompt, userMessage, {
+        maxTokens: 8000,
+        thinkingBudget: 0,
+      });
+    } else {
+      const response = await chat(
+        [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userMessage },
+        ],
+        { model, maxTokens: 8000, noFreeTier: true, temperature: 0 },
+      );
+      rawText = response.content;
+    }
+
+    if (!rawText) {
+      console.warn('[scorer] LLM returned null/empty content');
       return null;
     }
 
-    // Gemini 2.5 Flash thinking mode 會在正式 JSON 前插入大量推理文字，
-    // 推理文字本身含 { } 會使 indexOf('{') 抓錯位置。
-    // 解法：從尾端掃找最後一個頂層 JSON 物件（推理在前、答案在後）。
-    // 若裡面含 4 個必要 key（環境/生意/組織/人）即採用；否則 fallback 到首個 {。
     function extractOutermostJson(text: string): string | null {
       // 1. code fence
       const fenceMatch = text.match(/```(?:json)?\s*\n?([\s\S]*?)```/);
@@ -431,8 +437,7 @@ ${reportContent.slice(0, 80000)}`;
       return s !== -1 ? text.slice(s) : null;
     }
 
-    const rawText = response.content.trim();
-    const extracted = extractOutermostJson(rawText);
+    const extracted = extractOutermostJson(rawText.trim());
     if (!extracted) {
       console.warn(`[scorer] No JSON found in response (first 200 chars): ${rawText.slice(0, 200)}`);
       return null;

@@ -294,3 +294,56 @@ export async function chat(
 export function getEnv(key: string): string {
   return process.env[key] ?? '';
 }
+
+// ── Native Gemini generateContent (no OpenAI-compat wrapper) ──
+// Use this when you need thinkingConfig.thinkingBudget=0 to disable thinking mode,
+// which is NOT supported by the OpenAI-compatible endpoint.
+export async function geminiGenerateContent(
+  model: string,
+  systemPrompt: string,
+  userContent: string,
+  opts: { maxTokens?: number; temperature?: number; thinkingBudget?: number } = {},
+): Promise<string | null> {
+  if (!GOOGLE_STUDIO_KEY) throw new Error('[llm] GOOGLE_AI_STUDIO_API_KEY not set');
+  const bareModel = model.replace(/^google\//, '');
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${bareModel}:generateContent?key=${GOOGLE_STUDIO_KEY}`;
+
+  const generationConfig: Record<string, unknown> = {};
+  if (opts.maxTokens !== undefined)    generationConfig.maxOutputTokens = opts.maxTokens;
+  if (opts.temperature !== undefined)  generationConfig.temperature = opts.temperature;
+  if (opts.thinkingBudget !== undefined) {
+    generationConfig.thinkingConfig = { thinkingBudget: opts.thinkingBudget };
+  }
+
+  const body: Record<string, unknown> = {
+    systemInstruction: { parts: [{ text: systemPrompt }] },
+    contents: [{ role: 'user', parts: [{ text: userContent }] }],
+    generationConfig,
+  };
+
+  let res: Response | undefined;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (res.ok || ![429, 503].includes(res.status)) break;
+    if (attempt < 3) {
+      const delay = res.status === 503 ? 10_000 : 35_000;
+      console.warn(`  [llm] Gemini native ${res.status} (attempt ${attempt}/3) → waiting ${delay / 1000}s…`);
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+
+  if (!res!.ok) {
+    const errText = await res!.text();
+    throw new Error(`HTTP ${res!.status}: ${errText.slice(0, 300)}`);
+  }
+
+  const data = (await res.json()) as any;
+  return data?.candidates?.[0]?.content?.parts
+    ?.filter((p: any) => !p.thought)
+    ?.map((p: any) => p.text ?? '')
+    ?.join('') ?? null;
+}
