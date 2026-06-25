@@ -173,7 +173,7 @@ function scoreFromMainFile(content: string): { 環境: number; 生意: number; �
   return { 環境, 生意, 組織, 人 };
 }
 
-function heuristicScore(ticker: string): InitialMaxScore {
+function heuristicScore(ticker: string, isSmallCap = false): InitialMaxScore {
   const dir = getCompanyDir(ticker);
   const allFiles = fs.existsSync(dir) ? fs.readdirSync(dir) : [];
   const mainFile = path.join(dir, `${ticker}_Initial_MAX.md`);
@@ -261,12 +261,17 @@ function heuristicScore(ticker: string): InitialMaxScore {
     sectionCoverage = checkAllSectionsCovered(mainContent);
   }
 
+  const passTotal   = isSmallCap ? 60   : PASS_TOTAL;
+  const min環境h    = isSmallCap ? 12   : MIN_環境;
+  const min生意h    = isSmallCap ? 22   : MIN_生意;
+  const min組織h    = isSmallCap ? 10   : MIN_組織;
+  const min人h      = isSmallCap ? 12   : MIN_人;
   const passThreshold =
-    total >= PASS_TOTAL &&
-    環境Score >= MIN_環境 &&
-    生意Score >= MIN_生意 &&
-    組織Score >= MIN_組織 &&
-    人Score >= MIN_人 &&
+    total >= passTotal &&
+    環境Score >= min環境h &&
+    生意Score >= min生意h &&
+    組織Score >= min組織h &&
+    人Score >= min人h &&
     hasDCF &&
     sectionCoverage.allCovered;
 
@@ -388,27 +393,61 @@ ${reportContent.slice(0, 80000)}`;
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userMessage },
       ],
-      { model, maxTokens: 4096 },
+      // noFreeTier：評分絕不可用免費模型。Gemma/Nemotron 會回「可解析但垃圾」的分數
+      // （如組織維度直接給 0），被當成有效分數採用，比 LLM 失敗走 heuristic 更糟。
+      // maxTokens 12000：Gemini 2.5 Flash thinking mode 的 thinking token 佔用輸出預算，
+      // 4096 不夠同時放 thinking + JSON，會造成 content 截斷為 null。
+      { model, maxTokens: 12000, noFreeTier: true },
     );
 
-    if (!response.content) return null;
+    if (!response.content) {
+      console.warn('[scorer] LLM returned null/empty content (likely thinking-budget exhausted)');
+      return null;
+    }
 
-    let jsonStr = response.content.trim();
-    const fenceMatch = jsonStr.match(/```(?:json)?\s*\n?([\s\S]*?)```/);
-    if (fenceMatch) jsonStr = fenceMatch[1].trim();
+    // Gemini 2.5 Flash thinking mode 會在正式 JSON 前插入大量推理文字，
+    // 推理文字本身含 { } 會使 indexOf('{') 抓錯位置。
+    // 解法：從尾端掃找最後一個頂層 JSON 物件（推理在前、答案在後）。
+    // 若裡面含 4 個必要 key（環境/生意/組織/人）即採用；否則 fallback 到首個 {。
+    function extractOutermostJson(text: string): string | null {
+      // 1. code fence
+      const fenceMatch = text.match(/```(?:json)?\s*\n?([\s\S]*?)```/);
+      if (fenceMatch) return fenceMatch[1].trim();
+      // 2. 從尾找最後一個完整 {} 含評分 key
+      let depth = 0;
+      for (let i = text.length - 1; i >= 0; i--) {
+        if (text[i] === '}') depth++;
+        else if (text[i] === '{') {
+          depth--;
+          if (depth === 0) {
+            const candidate = text.slice(i);
+            if (/環境|生意|組織|人/.test(candidate)) return candidate;
+            depth = 0; // 不符合，繼續往前找
+          }
+        }
+      }
+      // 3. 最後備用：首個 {
+      const s = text.indexOf('{');
+      return s !== -1 ? text.slice(s) : null;
+    }
 
-    // Find outermost JSON object
-    const start = jsonStr.indexOf('{');
-    if (start === -1) return null;
-    let depth = 0;
+    const rawText = response.content.trim();
+    const extracted = extractOutermostJson(rawText);
+    if (!extracted) {
+      console.warn(`[scorer] No JSON found in response (first 200 chars): ${rawText.slice(0, 200)}`);
+      return null;
+    }
+
+    // Find outermost { } bounds within the extracted string
+    let depth2 = 0;
     let end = -1;
-    for (let i = start; i < jsonStr.length; i++) {
-      if (jsonStr[i] === '{') depth++;
-      else if (jsonStr[i] === '}') { depth--; if (depth === 0) { end = i; break; } }
+    for (let i = 0; i < extracted.length; i++) {
+      if (extracted[i] === '{') depth2++;
+      else if (extracted[i] === '}') { depth2--; if (depth2 === 0) { end = i; break; } }
     }
     if (end === -1) return null;
 
-    const parsed = JSON.parse(jsonStr.slice(start, end + 1));
+    const parsed = JSON.parse(extracted.slice(0, end + 1));
     const total = parsed.total ?? (
       (parsed['環境']?.score ?? 0) +
       (parsed['生意']?.score ?? 0) +
@@ -547,7 +586,7 @@ export async function scoreCompanyResearch(
     } else {
       // Heuristic fallback
       console.log('[scorer] LLM failed, using heuristic fallback');
-      score = { ...heuristicScore(ticker), round };
+      score = { ...heuristicScore(ticker, isSmallCap), round };
       console.log(`[scorer] Heuristic score: ${score.total}/100`);
     }
   }

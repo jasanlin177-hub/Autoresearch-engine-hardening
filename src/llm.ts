@@ -178,6 +178,10 @@ export async function chat(
     tools?: ToolDef[];
     toolChoice?: 'auto' | 'none';
     maxTokens?: number;
+    // 禁用 OpenRouter 免費模型層（Gemma/Nemotron 等）。
+    // 評分等「品質敏感」呼叫應設 true：免費模型會回傳「可解析但垃圾」的結果，
+    // 比直接失敗更糟（會被當成有效分數採用）。改走 heuristic / 付費層較安全。
+    noFreeTier?: boolean;
   },
 ): Promise<ChatResult> {
   const requestedModel = options?.model ?? 'google/gemini-2.5-flash';
@@ -203,14 +207,20 @@ export async function chat(
         return { ...result, provider: 'google-studio' };
       } catch (err: any) {
         const msg: string = err.message ?? '';
-        const is429  = msg.includes('429') || msg.toLowerCase().includes('quota') || msg.toLowerCase().includes('rate');
-        const isTimeout = msg.toLowerCase().includes('timeout');
-        if (is429 && attempt < MAX_RETRIES) {
-          console.warn(`  [llm] Google AI Studio rate limit (attempt ${attempt}/${MAX_RETRIES}) → waiting ${RETRY_DELAY_MS / 1000}s before retry…`);
-          await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
+        const lower = msg.toLowerCase();
+        const is429  = msg.includes('429') || lower.includes('quota') || lower.includes('rate');
+        // 503 / overloaded / high demand 為暫時性錯誤，與 429 同樣可重試，
+        // 不應立即 fallback 到爛模型。用較短退避（10s）即可，通常很快恢復。
+        const is503  = msg.includes('503') || lower.includes('overload') || lower.includes('high demand') || lower.includes('unavailable');
+        const isRetryable = is429 || is503;
+        const isTimeout = lower.includes('timeout');
+        if (isRetryable && attempt < MAX_RETRIES) {
+          const delay = is503 ? 10_000 : RETRY_DELAY_MS;
+          console.warn(`  [llm] Google AI Studio ${is503 ? 'overloaded(503)' : 'rate limit'} (attempt ${attempt}/${MAX_RETRIES}) → waiting ${delay / 1000}s before retry…`);
+          await new Promise(r => setTimeout(r, delay));
           continue;
-        } else if (is429) {
-          console.warn(`  [llm] Google AI Studio rate limit after ${MAX_RETRIES} attempts → falling back to OpenRouter`);
+        } else if (isRetryable) {
+          console.warn(`  [llm] Google AI Studio still failing after ${MAX_RETRIES} attempts → falling back to OpenRouter`);
         } else if (isTimeout) {
           console.warn(`  [llm] Google AI Studio timed out (${GOOGLE_TIMEOUT_MS / 1000}s) → falling back to OpenRouter`);
         } else {
@@ -223,7 +233,7 @@ export async function chat(
 
   // ── Fallback: OpenRouter 免費模型（僅在 Google 模型路徑下嘗試）──
   // 若使用者明確指定非 Google 模型（如 anthropic/claude-*），直接走付費，跳過免費層
-  const useFreeTier = isGoogleModel(requestedModel);
+  const useFreeTier = isGoogleModel(requestedModel) && !options?.noFreeTier;
   if (OPENROUTER_KEY && useFreeTier) {
     for (const freeModel of FREE_MODELS) {
       try {

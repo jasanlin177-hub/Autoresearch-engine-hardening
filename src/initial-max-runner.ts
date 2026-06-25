@@ -853,6 +853,10 @@ ${topGaps}
   const MAX_TOOL_ROUNDS = 20;
   let finalResponse = '';
 
+  // Polish 階段防 loop：每個 section_anchor 只允許 replace 一次。
+  // 否則模型會反覆 replace_section 同一節（觀察到單節被改寫 15 次），徒增成本與損壞風險。
+  const polishedAnchors = new Set<string>();
+
   for (let toolRound = 0; toolRound < MAX_TOOL_ROUNDS; toolRound++) {
     const response = await chat(messages, { model, tools, maxTokens: 16384 });
 
@@ -884,16 +888,26 @@ ${topGaps}
           console.log(`  [fetch] ${args.url?.slice(0, 80)}...`);
           result = await fetchUrl(args.url ?? '');
           break;
-        case 'write_research_section':
-          console.log(`  [write] ${args.ticker}/${args.filename} (${(args.content ?? '').length} chars)${args.mode === 'replace_section' || args.mode === 'insert_into_section' ? ` → ${args.mode} ${args.section_anchor}` : ''}`);
+        case 'write_research_section': {
+          const wMode = (args.mode as 'append' | 'overwrite' | 'insert_into_section' | 'replace_section') ?? 'append';
+          const wAnchor = args.section_anchor as string | undefined;
+          // Polish 防 loop：同一節已 replace 過就拒絕，要求模型換節或結束。
+          if (phase === 'polish' && wMode === 'replace_section' && wAnchor && polishedAnchors.has(wAnchor)) {
+            console.log(`  [write] (skipped) ${wAnchor} 已順稿過一次，拒絕重複 replace`);
+            result = JSON.stringify({ error: `section "${wAnchor}" 本輪已順稿完成，請改順其他小節或直接輸出 JSON summary 結束。` });
+            break;
+          }
+          console.log(`  [write] ${args.ticker}/${args.filename} (${(args.content ?? '').length} chars)${wMode === 'replace_section' || wMode === 'insert_into_section' ? ` → ${wMode} ${wAnchor}` : ''}`);
           result = writeResearchSection(
             args.ticker ?? ticker,
             args.filename ?? '',
             args.content ?? '',
-            (args.mode as 'append' | 'overwrite' | 'insert_into_section' | 'replace_section') ?? 'append',
-            args.section_anchor
+            wMode,
+            wAnchor
           );
+          if (phase === 'polish' && wMode === 'replace_section' && wAnchor) polishedAnchors.add(wAnchor);
           break;
+        }
         case 'read_research_file':
           result = readResearchFile(args.ticker ?? ticker, args.filename ?? '');
           break;
