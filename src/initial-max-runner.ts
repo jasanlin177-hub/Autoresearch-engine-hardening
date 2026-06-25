@@ -855,6 +855,13 @@ ${topGaps}
 
   // Polish 階段防 loop：每個 section_anchor 只允許 replace 一次。
   // 否則模型會反覆 replace_section 同一節（觀察到單節被改寫 15 次），徒增成本與損壞風險。
+  // normalize：剝除 # 前綴與標題中文字，只保留純節號（"### 2.1 商業模式" → "2.1"）
+  // 防止模型用不同格式的同一節號繞過 guard（實測：2.1 / 2.1 商業模式 / ### 2.1 商業模式）。
+  function normalizeAnchor(a: string): string {
+    const stripped = a.replace(/^#+\s*/, '').trim();
+    const m = stripped.match(/^[\d.]+/);
+    return m ? m[0] : stripped.toLowerCase();
+  }
   const polishedAnchors = new Set<string>();
 
   for (let toolRound = 0; toolRound < MAX_TOOL_ROUNDS; toolRound++) {
@@ -892,7 +899,9 @@ ${topGaps}
           const wMode = (args.mode as 'append' | 'overwrite' | 'insert_into_section' | 'replace_section') ?? 'append';
           const wAnchor = args.section_anchor as string | undefined;
           // Polish 防 loop：同一節已 replace 過就拒絕，要求模型換節或結束。
-          if (phase === 'polish' && wMode === 'replace_section' && wAnchor && polishedAnchors.has(wAnchor)) {
+          // 使用 normalizeAnchor 避免模型以不同格式（"2.1" vs "### 2.1 商業模式"）繞過 guard。
+          const wAnchorKey = wAnchor ? normalizeAnchor(wAnchor) : undefined;
+          if (phase === 'polish' && wMode === 'replace_section' && wAnchorKey && polishedAnchors.has(wAnchorKey)) {
             console.log(`  [write] (skipped) ${wAnchor} 已順稿過一次，拒絕重複 replace`);
             result = JSON.stringify({ error: `section "${wAnchor}" 本輪已順稿完成，請改順其他小節或直接輸出 JSON summary 結束。` });
             break;
@@ -905,7 +914,7 @@ ${topGaps}
             wMode,
             wAnchor
           );
-          if (phase === 'polish' && wMode === 'replace_section' && wAnchor) polishedAnchors.add(wAnchor);
+          if (phase === 'polish' && wMode === 'replace_section' && wAnchorKey) polishedAnchors.add(wAnchorKey);
           break;
         }
         case 'read_research_file':
