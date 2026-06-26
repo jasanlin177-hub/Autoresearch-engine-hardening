@@ -714,15 +714,15 @@ const GAP_FILL_TOOLS: ToolDef[] = [
     type: 'function',
     function: {
       name: 'fetch_official_disclosure',
-      description: '從公開資訊觀測站(MOPS)下載官方揭露文件並解析為文字。優先抓法說會簡報(conference)，其次財報(financial)、年報(annual)、月營收(revenue)。抓到後自動存入 official/ 子目錄，可用 read_research_file 讀取。**首輪若 official/ 無資料，請優先呼叫此工具建立官方數字基準，再用官方數字覆蓋媒體整理稿。**',
+      description: '從公開資訊觀測站(MOPS)下載官方揭露文件並解析為文字。優先抓法說會簡報(conference)，其次財報(financial)、年報(annual)、月營收(revenue)、歷史重大訊息(announcement)。抓到後自動存入 official/ 子目錄，可用 read_research_file 讀取。**首輪若 official/ 無資料，請優先呼叫此工具建立官方數字基準，再用官方數字覆蓋媒體整理稿。**',
       parameters: {
         type: 'object',
         properties: {
           ticker: { type: 'string', description: '股票代號，例如 "7740"' },
           types: {
             type: 'array',
-            items: { type: 'string', enum: ['conference', 'financial', 'annual', 'revenue'] },
-            description: '指定文件類型；不填則依預設序 conference > financial > revenue 全部抓取',
+            items: { type: 'string', enum: ['conference', 'financial', 'annual', 'revenue', 'announcement'] },
+            description: '指定文件類型；不填則依預設序 conference > financial > revenue > announcement 全部抓取',
           },
         },
         required: ['ticker'],

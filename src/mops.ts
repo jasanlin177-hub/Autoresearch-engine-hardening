@@ -8,7 +8,7 @@ const MOPS = 'https://mopsov.twse.com.tw';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 export interface OfficialDoc {
-  type: 'conference' | 'financial' | 'annual' | 'revenue';
+  type: 'conference' | 'financial' | 'annual' | 'revenue' | 'announcement';
   title: string;
   date: string;
   url: string;
@@ -126,6 +126,45 @@ async function fetchFinancialDocs(ticker: string): Promise<OfficialDoc[]> {
   return [];
 }
 
+/** 歷史重大訊息（ajax_t05st01）：抓近兩個民國年度，取主旨。 */
+async function fetchAnnouncementDocs(ticker: string): Promise<OfficialDoc[]> {
+  const roc = thisRocYear();
+  const lines: string[] = [];
+
+  for (const year of [roc, roc - 1]) {
+    try {
+      const html = await mopsPost('ajax_t05st01', { co_id: ticker, year: String(year), TYPEK: 'sii', firstin: '1' });
+      const text = htmlToText(html);
+      if (!text.includes('查無') && text.length > 500) {
+        // 每行格式：  6589 | 台康生技 | 115/03/09 | 17:30:17 | 主旨...
+        const rows = [...html.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)];
+        for (const row of rows) {
+          const cells = [...row[1].matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)]
+            .map(c => c[1].replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').trim());
+          if (cells.length >= 5 && /\d{3}\/\d{2}\/\d{2}/.test(cells[2] ?? '')) {
+            const date = cells[2].trim();
+            const subject = cells[4].replace(/\s+/g, ' ').trim();
+            if (subject) lines.push(`${date} ${subject}`);
+          }
+        }
+      }
+    } catch (e: any) {
+      console.error(`[mops] announcement ${year} failed for ${ticker}: ${e.message}`);
+    }
+  }
+
+  if (!lines.length) return [];
+  const text = `【重大訊息公告】（來源：公開資訊觀測站 t05st01）\n` + lines.join('\n');
+  return [{
+    type: 'announcement',
+    title: `重大訊息公告（近兩年）`,
+    date: String(roc),
+    url: `${MOPS}/mops/web/t05st01`,
+    text: text.slice(0, 60000),
+    chars: text.length,
+  }];
+}
+
 /** 近 12 個月月營收趨勢（每月一個 POST，組成趨勢表）。 */
 async function fetchRevenueDocs(ticker: string): Promise<OfficialDoc[]> {
   const now = new Date();
@@ -172,7 +211,7 @@ async function fetchRevenueDocs(ticker: string): Promise<OfficialDoc[]> {
 
 export async function fetchOfficialDisclosure(
   ticker: string,
-  types: ('conference' | 'financial' | 'annual' | 'revenue')[] = ['conference', 'financial', 'revenue'],
+  types: ('conference' | 'financial' | 'annual' | 'revenue' | 'announcement')[] = ['conference', 'financial', 'revenue', 'announcement'],
 ): Promise<OfficialDoc[]> {
   const results: OfficialDoc[] = [];
 
@@ -180,10 +219,11 @@ export async function fetchOfficialDisclosure(
     try {
       let docs: OfficialDoc[] = [];
       switch (type) {
-        case 'conference': docs = await fetchConferenceDocs(ticker); break;
+        case 'conference':   docs = await fetchConferenceDocs(ticker); break;
         case 'financial':
-        case 'annual':     docs = await fetchFinancialDocs(ticker); break;
-        case 'revenue':    docs = await fetchRevenueDocs(ticker); break;
+        case 'annual':       docs = await fetchFinancialDocs(ticker); break;
+        case 'revenue':      docs = await fetchRevenueDocs(ticker); break;
+        case 'announcement': docs = await fetchAnnouncementDocs(ticker); break;
       }
       results.push(...docs);
       if (docs.length) console.log(`[mops] ${type}: ${docs.length} doc(s), ${docs[0].chars} chars for ${ticker}`);
