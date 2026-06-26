@@ -16,11 +16,14 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 
 /**
- * 評分固定使用強模型，與「研究/補缺口」用的便宜模型脫鉤。
- * 原本 runner 把自己的 gemini-2.5-flash 一路傳進評分器，導致「Flash 寫、Flash 評」，
- * 評分一致性差、誤導迭代方向。評分必須穩定才能當迭代的指北針。
+ * 評分固定模型。用 gemini-2.5-flash 而非 Pro，原因是評分穩定性靠兩個機制：
+ *   1. temperature:0 → 確定性（這才是「同份報告震盪 40 分」的真因）
+ *   2. thinkingBudget:0 → 關閉思考模式，避免思考 token 形成早期偏見（曾導致 組織=0）
+ * gemini-3.1-pro-preview 是「強制思考」模型，不接受 thinkingBudget:0（HTTP 400），
+ * 無法套用機制 2，反而把偏差帶回來，又更貴。故評分用 flash 才正確。
+ * 與「研究/補缺口」共用同一模型沒問題——關鍵是評分端鎖定 temp:0 + 關思考。
  */
-export const SCORER_MODEL = 'google/gemini-3.1-pro-preview';
+export const SCORER_MODEL = 'google/gemini-2.5-flash';
 
 const PASS_TOTAL = 95;
 const MIN_環境 = 16;
