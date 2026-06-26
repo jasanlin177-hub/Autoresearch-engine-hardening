@@ -865,7 +865,9 @@ ${topGaps}
   const polishedAnchors = new Set<string>();
 
   for (let toolRound = 0; toolRound < MAX_TOOL_ROUNDS; toolRound++) {
-    const response = await chat(messages, { model, tools, maxTokens: 16384 });
+    // noFreeTier：Google 模型 429 時跳過 OpenRouter 免費爛模型（Gemma/Nemotron），
+    // 直接走付費 flash。研究品質敏感，免費模型回傳「可解析但垃圾」比失敗更糟。
+    const response = await chat(messages, { model, tools, maxTokens: 16384, noFreeTier: true });
 
     if (response.content) finalResponse = response.content;
     if (response.toolCalls.length === 0) break;
@@ -981,6 +983,17 @@ async function main() {
   const investorNote = args.why ?? args.note ?? '';
   const tag = args.tag ?? new Date().toISOString().slice(5, 10).replace('-', '');
   const skillName = args.skill ?? args.market?.toLowerCase() === 'tw' ? 'tw-stock' : 'initial-max';
+
+  // 燒錢防呆：非 Google 模型（Claude/GPT 等）走 OpenRouter 付費，且無免費額度、
+  // 無自動快取，整批研究易意外燒掉數美元。需 --force 明確放行。
+  const isGoogleModelSelected = model.startsWith('google/') || model.startsWith('gemini-');
+  if (!isGoogleModelSelected && !force) {
+    console.error(`\n✗ 已選用非 Google 付費模型「${model}」。`);
+    console.error(`  此類模型走 OpenRouter 付費、無免費額度、無 prompt caching，整批研究易燒掉數美元。`);
+    console.error(`  預設模型 ${DEFAULT_MODEL} 走 Google 已付費 key，月成本極低。`);
+    console.error(`  若確定要用付費模型，請加 --force 放行。\n`);
+    process.exit(1);
+  }
 
   console.log('╔══════════════════════════════════════╗');
   console.log('║       Initial MAX Runner             ║');
