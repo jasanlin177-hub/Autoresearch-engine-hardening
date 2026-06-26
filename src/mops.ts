@@ -213,8 +213,8 @@ async function fetchRevenueDocs(ticker: string): Promise<OfficialDoc[]> {
   }];
 }
 
-/** 帶重試的 GET（poorstock 偶發 socket 中斷，重試即穩定；無需關閉 TLS 驗證）。 */
-async function fetchWithRetry(url: string, tries = 4): Promise<Response> {
+/** 帶重試的 GET（poorstock 偶發 socket 中斷；漸進退避，6 次後仍失敗才放棄）。 */
+async function fetchWithRetry(url: string, tries = 6): Promise<Response> {
   let lastErr: any;
   for (let i = 1; i <= tries; i++) {
     try {
@@ -225,7 +225,8 @@ async function fetchWithRetry(url: string, tries = 4): Promise<Response> {
       });
     } catch (e) {
       lastErr = e;
-      if (i < tries) await new Promise(r => setTimeout(r, 1200));
+      // 漸進退避：1.5s, 3s, 4.5s, 6s, 7.5s（總等待約 22s）
+      if (i < tries) await new Promise(r => setTimeout(r, 1500 * i));
     }
   }
   throw lastErr;
