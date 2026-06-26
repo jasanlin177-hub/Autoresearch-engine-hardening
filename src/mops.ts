@@ -5,10 +5,11 @@
 // 更快也更穩定。端點與參數於 2026-06 驗證可用。
 
 const MOPS = 'https://mopsov.twse.com.tw';
+const POORSTOCK = 'https://poorstock.com';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 export interface OfficialDoc {
-  type: 'conference' | 'financial' | 'annual' | 'revenue' | 'announcement';
+  type: 'conference' | 'financial' | 'annual' | 'revenue' | 'announcement' | 'earningscall';
   title: string;
   date: string;
   url: string;
@@ -50,6 +51,9 @@ function htmlToText(html: string): string {
     .replace(/&amp;/g, '&')
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(parseInt(n, 10)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, n) => String.fromCodePoint(parseInt(n, 16)))
     .replace(/[ \t]+/g, ' ')
     .replace(/\s*\n\s*/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
@@ -209,9 +213,67 @@ async function fetchRevenueDocs(ticker: string): Promise<OfficialDoc[]> {
   }];
 }
 
+/** 帶重試的 GET（poorstock 偶發 socket 中斷，重試即穩定；無需關閉 TLS 驗證）。 */
+async function fetchWithRetry(url: string, tries = 4): Promise<Response> {
+  let lastErr: any;
+  for (let i = 1; i <= tries; i++) {
+    try {
+      return await fetch(url, {
+        headers: { 'User-Agent': UA, 'Accept-Language': 'zh-TW', Accept: 'text/html' },
+        redirect: 'follow',
+        signal: AbortSignal.timeout(20000),
+      });
+    } catch (e) {
+      lastErr = e;
+      if (i < tries) await new Promise(r => setTimeout(r, 1200));
+    }
+  }
+  throw lastErr;
+}
+
+/**
+ * poorstock 法說會 AI 摘要（散戶鬥嘴鼓）。
+ * URL pattern: /earningcall/{ticker}；每檔台股一頁，內含整篇 AI 預處理的法說會重點摘要
+ * （營收/產品線/市場數據/CEO 觀點），品質遠勝 MOPS 僅有的法說會「元資料」。
+ * 無效代號回 404；只取最新一場法說會的內容。
+ */
+async function fetchEarningsCallDocs(ticker: string): Promise<OfficialDoc[]> {
+  try {
+    const res = await fetchWithRetry(`${POORSTOCK}/earningcall/${ticker}`);
+    if (res.status === 404) return [];
+    const html = await res.text();
+    if (!html.includes('AI生成') && !html.includes('AI重點整理')) return [];
+
+    const full = htmlToText(html);
+    // 砍掉導覽列雜訊：從「公開資訊觀測站資訊」或「AI生成」起算才是正文
+    const startIdx = (() => {
+      const a = full.indexOf('公開資訊觀測站資訊');
+      const b = full.indexOf('AI生成');
+      if (a >= 0) return a;
+      if (b >= 0) return Math.max(0, b - 40);
+      return 0;
+    })();
+    const text = full.slice(startIdx).trim();
+    if (text.length < 400) return [];
+
+    const dateMatch = text.match(/(\d{4}\/\d{2}\/\d{2})/);
+    return [{
+      type: 'earningscall',
+      title: `法說會 AI 重點摘要（poorstock）`,
+      date: dateMatch?.[1] ?? '',
+      url: `${POORSTOCK}/earningcall/${ticker}`,
+      text: text.slice(0, 60000),
+      chars: text.length,
+    }];
+  } catch (e: any) {
+    console.error(`[poorstock] earningscall failed for ${ticker}: ${e.message}`);
+    return [];
+  }
+}
+
 export async function fetchOfficialDisclosure(
   ticker: string,
-  types: ('conference' | 'financial' | 'annual' | 'revenue' | 'announcement')[] = ['conference', 'financial', 'revenue', 'announcement'],
+  types: ('conference' | 'financial' | 'annual' | 'revenue' | 'announcement' | 'earningscall')[] = ['conference', 'financial', 'revenue', 'announcement', 'earningscall'],
 ): Promise<OfficialDoc[]> {
   const results: OfficialDoc[] = [];
 
@@ -224,6 +286,7 @@ export async function fetchOfficialDisclosure(
         case 'annual':       docs = await fetchFinancialDocs(ticker); break;
         case 'revenue':      docs = await fetchRevenueDocs(ticker); break;
         case 'announcement': docs = await fetchAnnouncementDocs(ticker); break;
+        case 'earningscall': docs = await fetchEarningsCallDocs(ticker); break;
       }
       results.push(...docs);
       if (docs.length) console.log(`[mops] ${type}: ${docs.length} doc(s), ${docs[0].chars} chars for ${ticker}`);

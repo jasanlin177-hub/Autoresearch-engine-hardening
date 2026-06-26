@@ -22,7 +22,7 @@ import path from 'path';
 import { execSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { chat, type Message, type ToolDef, type ToolCall } from './llm.js';
-import { scoreCompanyResearch, type InitialMaxScore, type InitialMaxGaps } from './initial-max-scorer.js';
+import { scoreCompanyResearch, SCORER_MODEL, type InitialMaxScore, type InitialMaxGaps } from './initial-max-scorer.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '..');
@@ -714,15 +714,15 @@ const GAP_FILL_TOOLS: ToolDef[] = [
     type: 'function',
     function: {
       name: 'fetch_official_disclosure',
-      description: '從公開資訊觀測站(MOPS)下載官方揭露文件並解析為文字。優先抓法說會簡報(conference)，其次財報(financial)、年報(annual)、月營收(revenue)、歷史重大訊息(announcement)。抓到後自動存入 official/ 子目錄，可用 read_research_file 讀取。**首輪若 official/ 無資料，請優先呼叫此工具建立官方數字基準，再用官方數字覆蓋媒體整理稿。**',
+      description: '從公開資訊觀測站(MOPS)及 poorstock 下載官方揭露文件並解析為文字。法說會簡報元資料(conference)、財報(financial)、年報(annual)、月營收(revenue)、歷史重大訊息(announcement)、法說會AI重點摘要(earningscall，含營收/產品線/市場數據的完整法說內容)。抓到後自動存入 official/ 子目錄，可用 read_research_file 讀取。**首輪若 official/ 無資料，請優先呼叫此工具建立官方數字基準，再用官方數字覆蓋媒體整理稿。earningscall 對台股法說會內容最完整，務必抓取。**',
       parameters: {
         type: 'object',
         properties: {
           ticker: { type: 'string', description: '股票代號，例如 "7740"' },
           types: {
             type: 'array',
-            items: { type: 'string', enum: ['conference', 'financial', 'annual', 'revenue', 'announcement'] },
-            description: '指定文件類型；不填則依預設序 conference > financial > revenue > announcement 全部抓取',
+            items: { type: 'string', enum: ['conference', 'financial', 'annual', 'revenue', 'announcement', 'earningscall'] },
+            description: '指定文件類型；不填則依預設序 conference > financial > revenue > announcement > earningscall 全部抓取',
           },
         },
         required: ['ticker'],
@@ -1017,7 +1017,8 @@ async function main() {
 
   // Baseline score
   console.log('\n═══ Baseline Scoring ═══');
-  const { score: baselineScore, gaps: baselineGaps } = await scoreCompanyResearch(ticker, 0, model, market);
+  // 評分用強模型 SCORER_MODEL，與研究用的 model(Flash) 脫鉤，確保評分穩定。
+  const { score: baselineScore, gaps: baselineGaps } = await scoreCompanyResearch(ticker, 0, SCORER_MODEL, market);
   const baselineResult: RoundResult = {
     round: 0,
     commit: gitShortHash(),
@@ -1077,7 +1078,7 @@ async function main() {
 
       // Score new state
       console.log('Scoring...');
-      const { score: newScore } = await scoreCompanyResearch(ticker, round, model, market);
+      const { score: newScore } = await scoreCompanyResearch(ticker, round, SCORER_MODEL, market);
       const delta = newScore.total - prevScore;
       console.log(`Score: ${newScore.total}/100 (${delta >= 0 ? '+' : ''}${delta} from ${prevScore})`);
 
@@ -1155,7 +1156,7 @@ async function main() {
       } catch {}
       console.log(`Polish summary: ${polishDesc}`);
       console.log('Scoring after polish...');
-      const { score: afterPolish } = await scoreCompanyResearch(ticker, polishRoundId, model, market);
+      const { score: afterPolish } = await scoreCompanyResearch(ticker, polishRoundId, SCORER_MODEL, market);
       console.log(`Score after polish: ${afterPolish.total}/100`);
       const commitHash = gitCommit(`initial-max polish: ${polishDesc.slice(0, 55)} — score ${afterPolish.total}/100`);
       history.push({

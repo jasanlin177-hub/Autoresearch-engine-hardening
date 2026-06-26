@@ -15,6 +15,13 @@ import { chat, geminiGenerateContent } from './llm.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 
+/**
+ * 評分固定使用強模型，與「研究/補缺口」用的便宜模型脫鉤。
+ * 原本 runner 把自己的 gemini-2.5-flash 一路傳進評分器，導致「Flash 寫、Flash 評」，
+ * 評分一致性差、誤導迭代方向。評分必須穩定才能當迭代的指北針。
+ */
+export const SCORER_MODEL = 'google/gemini-3.1-pro-preview';
+
 const PASS_TOTAL = 95;
 const MIN_環境 = 16;
 const MIN_生意 = 30;
@@ -398,6 +405,7 @@ ${reportContent.slice(0, 80000)}`;
       rawText = await geminiGenerateContent(model, systemPrompt, userMessage, {
         maxTokens: 8000,
         thinkingBudget: 0,
+        temperature: 0, // 評分必須確定性：缺此參數時 Gemini 預設 temp≈1.0，同份報告分數震盪達 40 分
       });
     } else {
       const response = await chat(
@@ -552,12 +560,17 @@ function buildGapsJson(score: InitialMaxScore, round: number): InitialMaxGaps {
 export async function scoreCompanyResearch(
   ticker: string,
   round = 0,
-  model = 'google/gemini-3.1-pro-preview',
+  model = SCORER_MODEL,
   market = 'US',
 ): Promise<{ score: InitialMaxScore; gaps: InitialMaxGaps }> {
   const reportContent = readResearchFiles(ticker);
   const dir = getCompanyDir(ticker);
-  const isSmallCap = market.toUpperCase() === 'TW';
+  // 小型股判斷依市值（< 30 億 NTD）而非 market 旗標。
+  // market === 'TW'/'TWO' 只代表交易所，不等於小型股。
+  // 先嘗試從研究報告中擷取市值數字；若擷取不到，預設走標準門檻（非小型股）。
+  const mktCapMatch = reportContent.match(/市值[：:]\s*NT\$?\s*([\d,.]+)\s*億/);
+  const mktCapB = mktCapMatch ? parseFloat(mktCapMatch[1].replace(/,/g, '')) : null;
+  const isSmallCap = mktCapB !== null ? mktCapB < 30 : false;
 
   let score: InitialMaxScore;
 
@@ -631,7 +644,7 @@ async function main() {
     process.exit(1);
   }
 
-  const model = args.model ?? 'google/gemini-3.1-pro-preview';
+  const model = args.model ?? SCORER_MODEL;
   const round = parseInt(args.round ?? '0', 10);
   const market = args.market ?? 'US';
 
