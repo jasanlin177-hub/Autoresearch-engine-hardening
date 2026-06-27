@@ -467,10 +467,13 @@ ${reportContent.slice(0, 80000)}`;
       // Use native Gemini generateContent with thinkingBudget=0.
       // The OpenAI-compat endpoint does NOT support thinking_config → 400 error.
       // Native endpoint supports thinkingConfig and filters out thought parts automatically.
+      // 思考強制型模型（如 gemini-3.1-pro-preview）拒絕 thinkingBudget:0（HTTP 400），
+      // 須讓它思考並放大 token 上限容納思考；其餘模型（flash）關閉思考避免思考偏見。
+      const thinkingMandatory = /pro-preview|3\.1-pro|2\.5-pro/.test(model);
       rawText = await geminiGenerateContent(model, systemPrompt, userMessage, {
-        maxTokens: 8000,
-        thinkingBudget: 0,
+        maxTokens: thinkingMandatory ? 16000 : 8000,
         temperature: 0, // 評分必須確定性：缺此參數時 Gemini 預設 temp≈1.0，同份報告分數震盪達 40 分
+        ...(thinkingMandatory ? {} : { thinkingBudget: 0 }),
       });
     } else {
       const response = await chat(
