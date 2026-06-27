@@ -187,12 +187,15 @@ def add_styled_para(doc, text, style_name='Normal', bold=False, italic=False,
 
 # ── Main builder ──────────────────────────────────────────────────────────────
 
-def build_word(md_path, out_path):
+def build_word(md_path, out_path, ticker=None, company_name=None, market='TWO'):
     with open(md_path, encoding='utf-8') as f:
         raw = f.read()
 
     raw = deduplicate_sections(raw)
     raw = re.sub(r'（必達）', '', raw)   # 移除評分系統內部標記，不對外顯示
+
+    _ticker = ticker or '7738'
+    _company = company_name or f'（{_ticker}）'
 
     doc = Document()
     setup_document(doc)
@@ -203,7 +206,7 @@ def build_word(md_path, out_path):
     if HAS_FINANCIALS:
         try:
             print('  [cover] Fetching financial data…')
-            fin = fetch_financials('7738', 'TWO')
+            fin = fetch_financials(_ticker, market)
             print(f'  [cover] 股價 {fin.fmt_price()}  市值 {fin.fmt_mktcap()}')
         except Exception as e:
             print(f'  [cover] Financial fetch failed: {e}')
@@ -268,8 +271,8 @@ def build_word(md_path, out_path):
     hdr_tbl = doc.add_table(rows=6, cols=1)
     hdr_tbl.style = 'Table Grid'
     rows_data = [
-        ('股票代號　7738　｜　' + market_str, 13, False, (0xA8, 0xD4, 0xF5)),
-        ('東聯互動', 42, True,  (0xFF, 0xFF, 0xFF)),
+        (f'股票代號　{_ticker}　｜　' + market_str, 13, False, (0xA8, 0xD4, 0xF5)),
+        (_company, 42, True,  (0xFF, 0xFF, 0xFF)),
         ('深度研究報告', 18, False, (0xA8, 0xD4, 0xF5)),
         (f'目前股價：{price_str}　｜　市值：{mktcap_str}', 11, False, (0xC0, 0xD8, 0xEE)),
         (f'產業：{sector_str}　｜　產出日期：{report_date}', 10, False, (0xC0, 0xD8, 0xEE)),
@@ -529,6 +532,13 @@ def build_word(md_path, out_path):
 
 
 if __name__ == '__main__':
-    md  = r'C:\Users\機動小隊\TaiEquityautoresearch\data\companies\7738\7738_Initial_MAX.md'
-    out = r'C:\Users\機動小隊\TaiEquityautoresearch\data\companies\7738\7738_Report.docx'
-    build_word(md, out)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--ticker', default='7738')
+    parser.add_argument('--company', default=None)
+    parser.add_argument('--market', default='TWO')
+    args = parser.parse_args()
+    base = rf'C:\Users\機動小隊\TaiEquityautoresearch\data\companies\{args.ticker}'
+    md  = rf'{base}\{args.ticker}_Initial_MAX.md'
+    out = rf'{base}\{args.ticker}_Report.docx'
+    build_word(md, out, ticker=args.ticker, company_name=args.company, market=args.market)

@@ -4,3 +4,4 @@ results/*.tsv
 data/companies/*/
 !data/companies/.gitkeep
 __pycache__/
+.cache/
