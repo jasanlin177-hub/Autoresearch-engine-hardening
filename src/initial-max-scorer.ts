@@ -31,6 +31,33 @@ const MIN_生意 = 30;
 const MIN_組織 = 16;
 const MIN_人 = 20;
 
+/**
+ * 市值分級 → 只決定「整體達標門檻」（institutional 期待），
+ * **不影響任何單一維度如何給分**（尤其「人」維度已改為涵蓋率×深度，與市值脫鉤）。
+ * 大型股資料豐沛、要求嚴；中小型放寬。數字可依需要調整。
+ */
+export type CapTier = 'large' | 'mid' | 'small' | 'unknown';
+interface TierThreshold { total: number; 環境: number; 生意: number; 組織: number; 人: number; }
+const TIER_THRESHOLDS: Record<CapTier, TierThreshold> = {
+  large:   { total: 95, 環境: 16, 生意: 30, 組織: 16, 人: 20 }, // ≥500 億
+  mid:     { total: 75, 環境: 14, 生意: 25, 組織: 13, 人: 14 }, // 30–500 億
+  small:   { total: 60, 環境: 12, 生意: 22, 組織: 10, 人: 12 }, // <30 億
+  unknown: { total: 75, 環境: 14, 生意: 25, 組織: 13, 人: 14 }, // 抓不到市值→比照中型（保守）
+};
+
+/** 從報告擷取市值（億元）。容錯「約」「NT$」「逗號」等格式。 */
+function detectMarketCapB(report: string): number | null {
+  const m = report.match(/市值[：:]?\s*(?:約\s*)?(?:NT\$?\s*)?([\d,]+(?:\.\d+)?)\s*億/);
+  return m ? parseFloat(m[1].replace(/,/g, '')) : null;
+}
+
+function capTier(mktCapB: number | null): CapTier {
+  if (mktCapB === null) return 'unknown';
+  if (mktCapB >= 500) return 'large';
+  if (mktCapB >= 30)  return 'mid';
+  return 'small';
+}
+
 /** 主檔必備子節（1.1～4.2），每節皆須有實質內容才達標 */
 const REQUIRED_SECTIONS = ['1.1', '1.2', '1.3', '1.4', '2.1', '2.2', '2.3', '2.4', '2.5', '3.1', '3.2', '3.3', '4.1', '4.2'];
 const MIN_SECTION_CHARS = 80;
@@ -183,7 +210,7 @@ function scoreFromMainFile(content: string): { 環境: number; 生意: number; �
   return { 環境, 生意, 組織, 人 };
 }
 
-function heuristicScore(ticker: string, isSmallCap = false): InitialMaxScore {
+function heuristicScore(ticker: string, threshold: TierThreshold = TIER_THRESHOLDS.large): InitialMaxScore {
   const dir = getCompanyDir(ticker);
   const allFiles = fs.existsSync(dir) ? fs.readdirSync(dir) : [];
   const mainFile = path.join(dir, `${ticker}_Initial_MAX.md`);
@@ -271,17 +298,12 @@ function heuristicScore(ticker: string, isSmallCap = false): InitialMaxScore {
     sectionCoverage = checkAllSectionsCovered(mainContent);
   }
 
-  const passTotal   = isSmallCap ? 60   : PASS_TOTAL;
-  const min環境h    = isSmallCap ? 12   : MIN_環境;
-  const min生意h    = isSmallCap ? 22   : MIN_生意;
-  const min組織h    = isSmallCap ? 10   : MIN_組織;
-  const min人h      = isSmallCap ? 12   : MIN_人;
   const passThreshold =
-    total >= passTotal &&
-    環境Score >= min環境h &&
-    生意Score >= min生意h &&
-    組織Score >= min組織h &&
-    人Score >= min人h &&
+    total >= threshold.total &&
+    環境Score >= threshold.環境 &&
+    生意Score >= threshold.生意 &&
+    組織Score >= threshold.組織 &&
+    人Score >= threshold.人 &&
     hasDCF &&
     sectionCoverage.allCovered;
 
@@ -324,18 +346,23 @@ const SCORER_SYSTEM_PROMPT = `你是一位專業的投資研究品質評審。�
 - 組織文化與激勵機制（人才策略+股權激勵+逆勢擴張案例）：0-6分
 - 運營效率（ROIC趨勢計算/Operating Leverage分析）：0-6分
 
-### 四、人 (25分，最低 20 才達標)
+### 四、人 (25分)
+> ⚠️ **本維度計分與公司市值/規模完全無關**。市值只決定整體達標門檻，不影響「人」如何給分。
 - CEO格局觀與商業哲學（多年敘事，第一性原理決策邏輯）：0-5分
 - 道德操守與價值創造驅動力（具體案例佐證，非泛泛描述）：0-5分
-- 公開訪談**≥25篇**+逐字稿已下載至transcripts/：0-15分 [計算公式：min(訪談數/25, 1.0)×15]
+- **CEO 訪談材料運用（涵蓋率 × 分析深度）：0-15分**
+  - **評的是「研究者有沒有把『實際存在』的 CEO 公開材料抓全、用好」，不是絕對篇數。**
+  - **嚴禁用固定篇數門檻（如 25 篇、5 篇）扣分。** 低調 CEO 公開受訪本就稀少；若報告已捕捉所有可得的訪談/逐字稿（有 URL），並從中萃取關鍵原話、串成跨年代敘事、做出有洞見的分析，**本項可給滿分 15**。
+  - 給分依據：①涵蓋率——是否把現存可得的 CEO 訪談都找到並引用（見下方【證據普查】提示，若有）；②深度——是否不只堆引言，而是分析其決策邏輯、轉折、反思。
+  - 僅有 1–2 則淺層引用、無分析 → 低分（3–6）；涵蓋齊全且分析透徹 → 高分（12–15）。
 
 ## 嚴格扣分規則（必遵）
 - **無出處的數字一律不計分**：TAM、市占、營收、地理分部等未標年報/法說出處則該項扣分。
 - **出處應可驗證**：在通常可取得公開連結的情境下（年報、法說、新聞、訪談），若僅寫來源名稱或檔名而**無 \`http(s)\` 連結**，該條出處從嚴扣分；已附可點擊連結者從寬。
 - **每個子點（1.1～4.1）須至少 5 則管理層直接引述**（引號「…」或 "…" + 出處+日期）；不足 5 則或為間接描述者，扣該維度分。
-- **CEO 引言**：僅計**直接引述**（有引號包住）；間接描述、轉述、無出處者不計入則數且扣分。
-- **訪談**：只計有實際 URL 的條目；滿分門檻為 ≥25 篇。
-- 從嚴給分：可給可不給時給較低分；缺關鍵元素明顯扣分。
+- **CEO 引言**：僅計**直接引述**（有引號包住）；間接描述、轉述、無出處者不計入。
+- **訪談**：只計有實際 URL 的條目。**「人」維度的訪談項按涵蓋率×深度給分（見上），不設絕對篇數門檻。**
+- 從嚴給分：可給可不給時給較低分；缺關鍵元素明顯扣分。**唯「人」維度訪談項例外——不得因「篇數少」扣分，只看是否抓全現存材料並深入分析。**
 
 ## 輸出格式
 
@@ -368,33 +395,65 @@ const SCORER_SYSTEM_PROMPT = `你是一位專業的投資研究品質評審。�
   "total": 數字
 }`;
 
-const SMALL_CAP_SUPPLEMENT = `
+/** 從報告擷取 CEO 姓名（4.1 標題括號內，或常見職稱行）。 */
+function extractCeoName(report: string): string | null {
+  const h = report.match(/4\.1[^\n（(]*[（(]([一-龥]{2,4})[）)]/);
+  if (h) return h[1].trim();
+  // 職稱後緊接姓名；姓名限 2–3 字並排除常見接續字（從/在/於/曾/自/暨）避免多抓
+  const r = report.match(/(?:董事長|總經理|執行長|創辦人)[暨兼，、\s]{0,4}([一-龥]{2,3})(?![一-龥])/);
+  return r ? r[1].replace(/[從在於曾自暨]$/, '') : null;
+}
 
----
-## ⚠️ 小型股例外條款（本次評分適用）
+/**
+ * 證據普查（A，輔助）：用 Brave 估「該 CEO 網路上實際存在幾個合格訪談來源」，
+ * 當作「人」維度涵蓋率的分母提示。無 Brave key 或失敗 → 回 null，評分照常（純輔助）。
+ */
+async function evidenceCensus(ceoName: string): Promise<number | null> {
+  const key = process.env.BRAVE_SEARCH_API_KEY ?? '';
+  if (!key || key === 'REPLACE_ME') return null;
+  const domainHints = /(youtube|youtu\.be|ctee|chinatimes|udn|cnyes|gbimonthly|geneonline|bnext|cw\.com|businessweekly|businesstoday|moneydj|ntdtv|wealth|gvm|anue)/i;
+  const seen = new Set<string>();
+  try {
+    for (const q of [`${ceoName} 專訪 OR 訪談`, `${ceoName} 法說 OR 演講`]) {
+      const url = new URL('https://api.search.brave.com/res/v1/web/search');
+      url.searchParams.set('q', q);
+      url.searchParams.set('count', '15');
+      const r = await fetch(url, { headers: { Accept: 'application/json', 'X-Subscription-Token': key }, signal: AbortSignal.timeout(15000) });
+      if (!r.ok) continue;
+      const d = await r.json() as any;
+      for (const item of (d.web?.results ?? [])) {
+        const u: string = item.url ?? '';
+        const title: string = item.title ?? '';
+        if (domainHints.test(u) && (title.includes(ceoName) || /專訪|訪談|法說|演講|對談/.test(title))) {
+          seen.add(u.split('?')[0]);
+        }
+      }
+    }
+  } catch { return null; }
+  return seen.size || null;
+}
 
-本公司為**市值 < 30 億元台幣之小型上櫃股**，公開資訊稀缺，依以下寬鬆標準評分：
-
-1. **每子節引言門檻**：從 ≥5 則降為 ≥2 則（有 URL 出處即計分）
-2. **【強制覆蓋】CEO 訪談逐字稿計分公式**：本維度**必須**改用小型股公式 **min(訪談數 / 5, 1.0) × 15**，滿分門檻為 **≥5 篇**真實連結（**非** 25 篇）。
-   ⚠️ 前述主框架「人」維度寫的 min(訪談數/25,1)×15 與「≥25 篇」**在本次評分一律作廢、不得引用**。
-   範例（務必照算）：訪談 4 篇 → min(4/5,1)×15 = **12 分**；5 篇（含）以上 → **15 分**（滿分）；3 篇 → 9 分；2 篇 → 6 分。
-   逐字稿與法說會逐字稿（earningscall / 法說 transcript）皆計入「訪談數」。**不得**因「未達 25 篇」而給低分。
-3. **達標條件**：總分 ≥ **60 分**，且各維度達最低分：環境≥12、生意≥22、組織≥10、人≥12
-4. **法說記錄不足**：若 MOPS 無法說記錄，新聞報導替代視同有效出處
-5. **資訊揭露不足原則**：若某維度分數受限於公司公開資訊義務不足（非研究品質問題），應給予該維度滿分的 70% 作為基準分，而非 0 分
-6. **不得因「小公司媒體曝光少」而大量扣分**；重點評估研究者是否盡力蒐集所有可得資料
-`;
+/** 依市值分級與證據普查，動態組附加條款（脫鉤市值與「人」維度計分）。 */
+function buildSupplement(tier: CapTier, census: number | null): string {
+  const parts: string[] = [];
+  if (census !== null) {
+    parts.push(`【證據普查】引擎實搜該 CEO，網路上約可找到 **${census}** 個合格的公開訪談/法說來源。\n評「CEO 訪談材料運用」時，以此為**涵蓋率分母參考**：報告已捕捉其中大部分並深入分析即應給高分；**絕不可因「篇數少」本身扣分**（這位 CEO 公開受訪本就只有這麼多）。`);
+  }
+  if (tier !== 'large') {
+    parts.push(`【揭露有限之公平評分】本標的非大型股，部分公開資訊先天較少：\n- 每子點引言門檻從 ≥5 則降為 ≥2 則（有 URL 出處即計分）。\n- 若某維度受限於「公司/CEO 公開揭露本就稀少」（非研究不力），給該維度滿分的 70% 作為基準分，而非 0 分。\n- 法說/新聞替代訪談視同有效出處。不得因「曝光少」大量扣分；重點是研究者是否抓全所有可得資料。`);
+  }
+  if (!parts.length) return '';
+  return `\n\n---\n## ⚠️ 本次評分附加條款\n\n` + parts.join('\n\n');
+}
 
 async function llmScore(
   ticker: string,
   reportContent: string,
-  model = 'google/gemini-3.1-pro-preview',
-  isSmallCap = false,
+  model = SCORER_MODEL,
+  supplement = '',
+  threshold: TierThreshold = TIER_THRESHOLDS.large,
 ): Promise<InitialMaxScore | null> {
-  const systemPrompt = isSmallCap
-    ? SCORER_SYSTEM_PROMPT + SMALL_CAP_SUPPLEMENT
-    : SCORER_SYSTEM_PROMPT;
+  const systemPrompt = SCORER_SYSTEM_PROMPT + supplement;
 
   const userMessage = `請評分以下 ${ticker} 的研究報告：
 
@@ -478,17 +537,12 @@ ${reportContent.slice(0, 80000)}`;
     const 生意 = parsed['生意']?.score ?? 0;
     const 組織 = parsed['組織']?.score ?? 0;
     const 人 = parsed['人']?.score ?? 0;
-    const passTotal = isSmallCap ? 60 : PASS_TOTAL;
-    const min環境 = isSmallCap ? 12 : MIN_環境;
-    const min生意 = isSmallCap ? 22 : MIN_生意;
-    const min組織 = isSmallCap ? 10 : MIN_組織;
-    const min人 = isSmallCap ? 12 : MIN_人;
     const passThreshold =
-      total >= passTotal &&
-      環境 >= min環境 &&
-      生意 >= min生意 &&
-      組織 >= min組織 &&
-      人 >= min人;
+      total >= threshold.total &&
+      環境 >= threshold.環境 &&
+      生意 >= threshold.生意 &&
+      組織 >= threshold.組織 &&
+      人 >= threshold.人;
 
     return {
       環境: { score: 環境, max: 20, criteria: parsed['環境']?.criteria, gaps: parsed['環境']?.gaps ?? [] },
@@ -571,12 +625,11 @@ export async function scoreCompanyResearch(
 ): Promise<{ score: InitialMaxScore; gaps: InitialMaxGaps }> {
   const reportContent = readResearchFiles(ticker);
   const dir = getCompanyDir(ticker);
-  // 小型股判斷依市值（< 30 億 NTD）而非 market 旗標。
-  // market === 'TW'/'TWO' 只代表交易所，不等於小型股。
-  // 先嘗試從研究報告中擷取市值數字；若擷取不到，預設走標準門檻（非小型股）。
-  const mktCapMatch = reportContent.match(/市值[：:]\s*NT\$?\s*([\d,.]+)\s*億/);
-  const mktCapB = mktCapMatch ? parseFloat(mktCapMatch[1].replace(/,/g, '')) : null;
-  const isSmallCap = mktCapB !== null ? mktCapB < 30 : false;
+  // 市值只決定「整體達標門檻」（large/mid/small），不影響任何維度如何給分。
+  // market 旗標只代表交易所，不等於規模——一律以報告中的市值數字分級。
+  const mktCapB = detectMarketCapB(reportContent);
+  const tier = capTier(mktCapB);
+  const threshold = TIER_THRESHOLDS[tier];
 
   let score: InitialMaxScore;
 
@@ -592,9 +645,16 @@ export async function scoreCompanyResearch(
       round,
     };
   } else {
+    // 證據普查（A，輔助）：估該 CEO 實際可得訪談數，當「人」維度涵蓋率分母提示。
+    const ceoName = extractCeoName(reportContent);
+    const census = ceoName ? await evidenceCensus(ceoName) : null;
+    const supplement = buildSupplement(tier, census);
+    console.log(`[scorer] tier=${tier}${mktCapB !== null ? `(${mktCapB}億)` : '(市值未知)'} 門檻=${threshold.total}` +
+      (census !== null ? ` 證據普查:${ceoName}≈${census}篇` : ''));
+
     // Try LLM scorer
     console.log(`[scorer] Running LLM scorer (${model}) for ${ticker}...`);
-    const llmResult = await llmScore(ticker, reportContent, model, isSmallCap);
+    const llmResult = await llmScore(ticker, reportContent, model, supplement, threshold);
 
     if (llmResult) {
       score = { ...llmResult, round };
@@ -610,7 +670,7 @@ export async function scoreCompanyResearch(
     } else {
       // Heuristic fallback
       console.log('[scorer] LLM failed, using heuristic fallback');
-      score = { ...heuristicScore(ticker, isSmallCap), round };
+      score = { ...heuristicScore(ticker, threshold), round };
       console.log(`[scorer] Heuristic score: ${score.total}/100`);
     }
   }
@@ -656,7 +716,8 @@ async function main() {
 
   const { score } = await scoreCompanyResearch(ticker.toUpperCase(), round, model, market);
 
-  const passLabel = market.toUpperCase() === 'TW' ? '≥60 小型股門檻' : '≥95 且各維度達標';
+  // 門檻依市值分級（large≥95 / mid≥75 / small≥60），由 scorer log 印出實際 tier。
+  const passLabel = '依市值分級門檻（見上方 tier 行）';
   console.log('\n╔══════════════════════════════════════╗');
   console.log(`║  Initial MAX Score: ${ticker.padEnd(6)} ${String(score.total).padStart(3)}/100        ║`);
   console.log('╚══════════════════════════════════════╝');
