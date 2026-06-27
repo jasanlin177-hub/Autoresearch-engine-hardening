@@ -25,6 +25,12 @@ const PROJECT_ROOT = path.resolve(__dirname, '..');
  */
 export const SCORER_MODEL = 'google/gemini-2.5-flash';
 
+/**
+ * 評分取樣次數：flash 在 temp:0 下仍有 ±6 底噪（組織偶爾 16↔12）。
+ * 並行跑 N 次取「總分中位數」那一輪，抵消隨機雜訊；牆鐘時間≈單次（並行），成本 N× flash（極廉）。
+ */
+const SCORER_SAMPLES = 3;
+
 const PASS_TOTAL = 95;
 const MIN_環境 = 16;
 const MIN_生意 = 30;
@@ -413,6 +419,7 @@ async function evidenceCensus(ceoName: string): Promise<number | null> {
   if (!key || key === 'REPLACE_ME') return null;
   const domainHints = /(youtube|youtu\.be|ctee|chinatimes|udn|cnyes|gbimonthly|geneonline|bnext|cw\.com|businessweekly|businesstoday|moneydj|ntdtv|wealth|gvm|anue)/i;
   const seen = new Set<string>();
+  let ok = false;
   try {
     for (const q of [`${ceoName} 專訪 OR 訪談`, `${ceoName} 法說 OR 演講`]) {
       const url = new URL('https://api.search.brave.com/res/v1/web/search');
@@ -428,9 +435,11 @@ async function evidenceCensus(ceoName: string): Promise<number | null> {
           seen.add(u.split('?')[0]);
         }
       }
+      ok = true; // 至少一次查詢成功（即使 0 命中也算成功，不可當失敗）
     }
   } catch { return null; }
-  return seen.size || null;
+  // 區分「Brave 失敗（null，不快取）」與「查詢成功但 0 命中（回 0，可快取）」
+  return ok ? seen.size : null;
 }
 
 /**
@@ -601,6 +610,30 @@ ${reportContent.slice(0, 80000)}`;
   }
 }
 
+/**
+ * 並行評分 SCORER_SAMPLES 次，取「總分中位數」那一輪的完整結果。
+ * 取整輪（而非各維度分別取中位數）以保持維度組合自洽。抵消 flash 的 ±6 隨機底噪。
+ */
+async function medianLlmScore(
+  ticker: string,
+  reportContent: string,
+  model: string,
+  supplement: string,
+  threshold: TierThreshold,
+): Promise<InitialMaxScore | null> {
+  const runs = await Promise.all(
+    Array.from({ length: SCORER_SAMPLES }, () =>
+      llmScore(ticker, reportContent, model, supplement, threshold).catch(() => null),
+    ),
+  );
+  const valid = runs.filter((r): r is InitialMaxScore => r !== null);
+  if (!valid.length) return null;
+  valid.sort((a, b) => a.total - b.total);
+  const median = valid[Math.floor(valid.length / 2)];
+  console.log(`[scorer] ${SCORER_SAMPLES} 取樣總分=[${valid.map(v => v.total).join(', ')}] → 中位數 ${median.total}`);
+  return median;
+}
+
 // ── Gap builder ──
 
 function buildGapsJson(score: InitialMaxScore, round: number): InitialMaxGaps {
@@ -698,9 +731,9 @@ export async function scoreCompanyResearch(
     console.log(`[scorer] tier=${tier}${mktCapB !== null ? `(${mktCapB}億)` : '(市值未知)'} 門檻=${threshold.total}` +
       (census !== null ? ` 證據普查:${ceoName}≈${census}篇` : ''));
 
-    // Try LLM scorer
-    console.log(`[scorer] Running LLM scorer (${model}) for ${ticker}...`);
-    const llmResult = await llmScore(ticker, reportContent, model, supplement, threshold);
+    // Try LLM scorer（並行取樣取中位數，抵消 flash 底噪）
+    console.log(`[scorer] Running LLM scorer (${model} ×${SCORER_SAMPLES}) for ${ticker}...`);
+    const llmResult = await medianLlmScore(ticker, reportContent, model, supplement, threshold);
 
     if (llmResult) {
       score = { ...llmResult, round };
