@@ -433,6 +433,45 @@ async function evidenceCensus(ceoName: string): Promise<number | null> {
   return seen.size || null;
 }
 
+/**
+ * 證據普查快取：同一位 CEO 只實搜一次，存 data/companies/{ticker}/ceo_census.json，
+ * 之後重用——避免 Brave 偶發失敗造成評分在「有錨/無錨」間跳動（跨輪穩定性的關鍵）。
+ * CEO 換人才重算；Brave 失敗時沿用既有快取（若 CEO 相同），維持穩定。
+ */
+async function getCachedCensus(ticker: string, ceoName: string): Promise<number | null> {
+  const cacheFile = path.join(getCompanyDir(ticker), 'ceo_census.json');
+
+  // 1) CEO 未變 → 直接重用
+  if (fs.existsSync(cacheFile)) {
+    try {
+      const c = JSON.parse(fs.readFileSync(cacheFile, 'utf-8'));
+      if (c.ceo === ceoName && typeof c.count === 'number') {
+        console.log(`[scorer] 證據普查(快取): ${ceoName}≈${c.count}篇`);
+        return c.count;
+      }
+    } catch { /* 壞檔→重算 */ }
+  }
+
+  // 2) 重新普查；成功才寫快取
+  const count = await evidenceCensus(ceoName);
+  if (count !== null) {
+    try {
+      fs.mkdirSync(getCompanyDir(ticker), { recursive: true });
+      fs.writeFileSync(cacheFile, JSON.stringify({ ceo: ceoName, count, ts: new Date().toISOString() }, null, 2));
+    } catch { /* 寫不進去不影響評分 */ }
+    return count;
+  }
+
+  // 3) Brave 失敗：沿用同一 CEO 的舊快取（若有），否則 null
+  if (fs.existsSync(cacheFile)) {
+    try {
+      const c = JSON.parse(fs.readFileSync(cacheFile, 'utf-8'));
+      if (c.ceo === ceoName && typeof c.count === 'number') return c.count;
+    } catch { /* ignore */ }
+  }
+  return null;
+}
+
 /** 依市值分級與證據普查，動態組附加條款（脫鉤市值與「人」維度計分）。 */
 function buildSupplement(tier: CapTier, census: number | null): string {
   const parts: string[] = [];
@@ -649,8 +688,12 @@ export async function scoreCompanyResearch(
     };
   } else {
     // 證據普查（A，輔助）：估該 CEO 實際可得訪談數，當「人」維度涵蓋率分母提示。
-    const ceoName = extractCeoName(reportContent);
-    const census = ceoName ? await evidenceCensus(ceoName) : null;
+    // 透過快取確保跨輪一致（同一 CEO 只搜一次），避免 Brave 偶發失敗造成分數跳動。
+    // CEO 名字從「完整主檔」擷取（reportContent 是截斷拼接版，4.1 標題可能被切掉）。
+    const mainFileForCeo = path.join(dir, `${ticker}_Initial_MAX.md`);
+    const ceoSource = fs.existsSync(mainFileForCeo) ? fs.readFileSync(mainFileForCeo, 'utf-8') : reportContent;
+    const ceoName = extractCeoName(ceoSource);
+    const census = ceoName ? await getCachedCensus(ticker, ceoName) : null;
     const supplement = buildSupplement(tier, census);
     console.log(`[scorer] tier=${tier}${mktCapB !== null ? `(${mktCapB}億)` : '(市值未知)'} 門檻=${threshold.total}` +
       (census !== null ? ` 證據普查:${ceoName}≈${census}篇` : ''));
