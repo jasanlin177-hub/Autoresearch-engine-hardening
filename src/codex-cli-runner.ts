@@ -165,13 +165,16 @@ async function spawnCodex(prompt: string, timeoutMs = 900_000): Promise<CliResul
     let stdout = '';
     let stderr = '';
     let lastAgentMessage = '';
+    let errorMessage: string | null = null;
     let usage: { input_tokens?: number; output_tokens?: number } = {};
     let buffer = '';
 
     proc.stdout.on('data', (d: Buffer) => {
       stdout += d.toString();
       buffer += d.toString();
-      // 逐行解析 JSONL：agent_message 取 text，turn.completed 取 usage
+      // 逐行解析 JSONL：agent_message 取 text，turn.completed 取 usage，
+      // error/turn.failed 取真正的失敗原因（例如額度用完），不然 close 時只能
+      // fallback 到 stdout 開頭的「Reading prompt from stdin...」這種無意義文字。
       const lines = buffer.split('\n');
       buffer = lines.pop() ?? '';
       for (const line of lines) {
@@ -183,6 +186,8 @@ async function spawnCodex(prompt: string, timeoutMs = 900_000): Promise<CliResul
             lastAgentMessage = ev.item.text ?? lastAgentMessage;
           } else if (ev.type === 'turn.completed' && ev.usage) {
             usage = ev.usage;
+          } else if (ev.type === 'turn.failed' || ev.type === 'error') {
+            errorMessage = ev.error?.message ?? ev.message ?? errorMessage;
           }
         } catch { /* 非 JSON 行忽略 */ }
       }
@@ -197,7 +202,7 @@ async function spawnCodex(prompt: string, timeoutMs = 900_000): Promise<CliResul
     proc.on('close', (code) => {
       clearTimeout(timer);
       if (code !== 0 && !lastAgentMessage) {
-        reject(new Error(`codex CLI exited ${code}: ${stderr.slice(0, 200) || stdout.slice(0, 200)}`));
+        reject(new Error(`codex CLI exited ${code}: ${errorMessage ?? (stderr.slice(0, 200) || stdout.slice(0, 200))}`));
         return;
       }
       resolve({
