@@ -657,15 +657,23 @@ async function llmScoreViaCli(
   }
 }
 
-/** `claude -p`，關閉所有工具（--tools ""）+ --bare 加速，只做純文字判讀。 */
-async function spawnClaudeScorer(prompt: string, timeoutMs = 120_000): Promise<string | null> {
+/**
+ * `claude -p`，關閉所有工具（--tools ""），只做純文字判讀。
+ * prompt 走 stdin（不用 `-p <prompt>` 命令列參數）：報告可達 80K 字元，
+ * 當命令列參數會超過 Windows 命令列長度上限而 spawn ENAMETOOLONG。
+ * 不加 --bare：--bare 強制只用 ANTHROPIC_API_KEY 認證、不讀 OAuth，
+ * 訂閱制（claudeAiOauth）帳號會「Not logged in」。
+ */
+async function spawnClaudeScorer(prompt: string, timeoutMs = 240_000): Promise<string | null> {
   return new Promise((resolve, reject) => {
-    const args = ['-p', prompt, '--output-format', 'json', '--tools', '', '--bare'];
+    const args = ['-p', '--output-format', 'json', '--tools', ''];
     const proc = spawn('claude', args, {
       cwd: PROJECT_ROOT,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env },
     });
+    proc.stdin.write(prompt);
+    proc.stdin.end();
     let stdout = '';
     let stderr = '';
     proc.stdout.on('data', (d: Buffer) => { stdout += d.toString(); });
@@ -731,8 +739,13 @@ async function spawnCodexScorer(prompt: string, timeoutMs = 120_000): Promise<st
 }
 
 /**
- * 並行評分 SCORER_SAMPLES 次，取「總分中位數」那一輪的完整結果。
+ * 並行評分 N 次，取「總分中位數」那一輪的完整結果。
  * 取整輪（而非各維度分別取中位數）以保持維度組合自洽。抵消 flash 的 ±6 隨機底噪。
+ *
+ * CLI 評分器（claude-cli/codex）只跑 1 次：
+ *   1) 取樣中位數是為了壓 Gemini API `temp=0` 的隨機底噪；CLI 評分本就較穩，不需要。
+ *   2) 每次 CLI 評分要拉起完整 session（數十秒～分鐘）；3 個並行會資源競爭互相拖死
+ *      （實測 claude 3 併發 >240s timeout，單次僅 ~50s）。跑 1 次快得多也夠用。
  */
 async function medianLlmScore(
   ticker: string,
@@ -742,8 +755,9 @@ async function medianLlmScore(
   threshold: TierThreshold,
   scorerEngine: 'api' | 'claude-cli' | 'codex' = 'api',
 ): Promise<InitialMaxScore | null> {
+  const samples = scorerEngine === 'api' ? SCORER_SAMPLES : 1;
   const runs = await Promise.all(
-    Array.from({ length: SCORER_SAMPLES }, () =>
+    Array.from({ length: samples }, () =>
       (scorerEngine === 'api'
         ? llmScore(ticker, reportContent, model, supplement, threshold)
         : llmScoreViaCli(ticker, reportContent, scorerEngine, supplement, threshold)
@@ -754,7 +768,7 @@ async function medianLlmScore(
   if (!valid.length) return null;
   valid.sort((a, b) => a.total - b.total);
   const median = valid[Math.floor(valid.length / 2)];
-  console.log(`[scorer] ${SCORER_SAMPLES} 取樣總分=[${valid.map(v => v.total).join(', ')}] → 中位數 ${median.total}`);
+  console.log(`[scorer] ${samples} 取樣總分=[${valid.map(v => v.total).join(', ')}] → 中位數 ${median.total}`);
   return median;
 }
 
@@ -857,8 +871,10 @@ export async function scoreCompanyResearch(
       (census !== null ? ` 證據普查:${ceoName}≈${census}篇` : ''));
 
     // Try LLM scorer（並行取樣取中位數，抵消底噪；scorerEngine 決定走 API 或 CLI）
+    // CLI 評分器只跑 1 次（見 medianLlmScore 註解），API 跑 SCORER_SAMPLES 次。
     const scorerLabel = scorerEngine === 'api' ? model : `${scorerEngine} (CLI)`;
-    console.log(`[scorer] Running LLM scorer (${scorerLabel} ×${SCORER_SAMPLES}) for ${ticker}...`);
+    const scorerSamples = scorerEngine === 'api' ? SCORER_SAMPLES : 1;
+    console.log(`[scorer] Running LLM scorer (${scorerLabel} ×${scorerSamples}) for ${ticker}...`);
     const llmResult = await medianLlmScore(ticker, reportContent, model, supplement, threshold, scorerEngine);
 
     if (llmResult) {

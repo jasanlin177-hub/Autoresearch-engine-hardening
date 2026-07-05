@@ -58,17 +58,49 @@ npm run tw-research -- --ticker 7738
 
 ```
 選項：
-  --ticker      股票代號（必填）
-  --rounds      最多輪數（預設 20）
-  --model       研究用 LLM（預設 google/gemini-2.5-flash）
-  --score-only  只跑評分，不執行研究
-  --force       跳過非 Google 模型安全檢查
+  --ticker         股票代號（必填）
+  --rounds         最多輪數（預設 20）
+  --model          研究用 LLM（預設 google/gemini-2.5-flash）
+  --engine         研究引擎：api（預設，Gemini）｜claude-cli｜codex
+  --scorer-engine  評分引擎：api（預設，Gemini）｜claude-cli｜codex
+  --score-only     只跑評分，不執行研究
+  --skip-polish    略過結束後的順稿整理輪
+  --force          跳過非 Google 模型安全檢查
 ```
+
+### 三種研究／評分引擎
+
+研究與評分各可獨立選引擎，`--engine` 管研究、`--scorer-engine` 管評分：
+
+| 引擎 | 底層 | 計費 | 適用 |
+|---|---|---|---|
+| `api`（預設） | Gemini API | 依 token（Flash 免費額度優先） | 快、便宜；Flash 指令遵循較弱 |
+| `claude-cli` | Claude Code CLI（`claude -p`） | 吃 Claude 訂閱額度 | 指令遵循強；每輪數分鐘 |
+| `codex` | OpenAI Codex CLI（`codex exec`） | 吃 ChatGPT 訂閱額度 | 指令遵循強；評分偏嚴 |
+
+> CLI 引擎需先在本機安裝並登入對應 CLI（`claude` / `codex`），使用訂閱制（OAuth）認證，不需額外 API 金鑰。
+
+```bash
+# 用 Codex 研究、Gemini 評分（預設評分）
+npm run tw-research-codex -- --ticker 7738
+
+# 用 Claude CLI 研究
+npm run tw-research-cli -- --ticker 7738
+
+# 研究用 Codex、評分也用 Codex（偏嚴，較貼 rubric 字面）
+npm run tw-research-codex -- --ticker 7738 --scorer-engine codex
+```
+
+**PDF 預先下載**：研究引擎啟動每輪前，runner 會掃描主檔內既有的 `.pdf` 連結（如公司年報），以瀏覽器 User-Agent 於本機下載＋解析文字（`src/pdf-prefetch.ts`），附進 prompt 供 agent 直接引用——繞過部分官網對非瀏覽器請求回 403 的封鎖。解析結果快取於 `data/companies/{ticker}/pdf_cache/`。
+
+**主檔備份**：每輪 gap-fill 前與 polish 前，主檔自動快照至 `data/companies/{ticker}/history/`（該目錄已 gitignore，為本機唯一回溯點）。
 
 ### 只跑評分
 
 ```bash
-npm run tw-score -- --ticker 7738
+npm run tw-score -- --ticker 7738            # Gemini（預設）
+npm run tw-score-cli -- --ticker 7738        # Claude Code CLI
+npm run tw-score-codex -- --ticker 7738      # OpenAI Codex CLI
 ```
 
 ### 產出報告

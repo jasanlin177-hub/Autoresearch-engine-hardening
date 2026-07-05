@@ -132,11 +132,15 @@ function buildPolishPrompt(ticker: string, score: number): string {
 {"description": "polish 整理摘要", "sections_polished": ["1.1", "4.1"]}`;
 }
 
-/** 執行 `claude -p` subprocess，回傳結果。gap-fill 深度研究一輪可能需要數分鐘。 */
+/**
+ * 執行 `claude -p` subprocess，回傳結果。gap-fill 深度研究一輪可能需要數分鐘。
+ * prompt 走 stdin（不用 `-p <prompt>` 命令列參數）：主檔全文＋PDF 附件可達數萬字元，
+ * 當命令列參數會超過 Windows 命令列長度上限而 spawn ENAMETOOLONG。
+ */
 async function spawnClaude(prompt: string, timeoutMs = 900_000): Promise<CliResult> {
   return new Promise((resolve, reject) => {
     const args = [
-      '-p', prompt,
+      '-p',
       '--output-format', 'json',
       '--allowedTools', 'Read,Write,Edit,Bash,WebSearch,Glob,Grep',
     ];
@@ -146,6 +150,8 @@ async function spawnClaude(prompt: string, timeoutMs = 900_000): Promise<CliResu
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env },
     });
+    proc.stdin.write(prompt);
+    proc.stdin.end();
 
     let stdout = '';
     let stderr = '';
