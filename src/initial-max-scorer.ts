@@ -412,13 +412,31 @@ const SCORER_SYSTEM_PROMPT = `你是一位專業的投資研究品質評審。�
   "total": 數字
 }`;
 
-/** 從報告擷取 CEO 姓名（4.1 標題括號內，或常見職稱行）。 */
-function extractCeoName(report: string): string | null {
+/**
+ * 從報告擷取 CEO 姓名：優先讀 4.1 標題括號內的名字（報告自己寫的，最可靠）；
+ * 否則向 MOPS 查該公司「董事長／總經理／發言人」結構化姓名，取其中確實出現在
+ * 報告內文的那一個。
+ *
+ * 原本的 fallback 是「職稱後緊接 2-3 個中文字」的散文正則，曾把「...換三任總經理，
+ * 也說明...」這種語句中職稱後方毫不相關的詞誤判成姓名，並寫入快取污染後續每輪
+ * 的證據普查分母。改錨定 MOPS 結構化姓名後，候選名必須是真實職務姓名，
+ * 且需真的出現在報告裡才採用，不再對任意散文字串猜測。
+ */
+async function extractCeoName(report: string, ticker: string): Promise<string | null> {
   const h = report.match(/4\.1[^\n（(]*[（(]([一-龥]{2,4})[）)]/);
   if (h) return h[1].trim();
-  // 職稱後緊接姓名；姓名限 2–3 字並排除常見接續字（從/在/於/曾/自/暨）避免多抓
-  const r = report.match(/(?:董事長|總經理|執行長|創辦人)[暨兼，、\s]{0,4}([一-龥]{2,3})(?![一-龥])/);
-  return r ? r[1].replace(/[從在於曾自暨]$/, '') : null;
+
+  try {
+    const { fetchCompanyOfficers } = await import('./mops.js');
+    const officers = await fetchCompanyOfficers(ticker);
+    if (!officers) return null;
+    const candidates = [officers.spokesperson, officers.chairman, officers.president].filter(
+      (n): n is string => !!n,
+    );
+    return candidates.find((name) => report.includes(name)) ?? null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -864,7 +882,7 @@ export async function scoreCompanyResearch(
     // CEO 名字從「完整主檔」擷取（reportContent 是截斷拼接版，4.1 標題可能被切掉）。
     const mainFileForCeo = path.join(dir, `${ticker}_Initial_MAX.md`);
     const ceoSource = fs.existsSync(mainFileForCeo) ? fs.readFileSync(mainFileForCeo, 'utf-8') : reportContent;
-    const ceoName = extractCeoName(ceoSource);
+    const ceoName = await extractCeoName(ceoSource, ticker);
     const census = ceoName ? await getCachedCensus(ticker, ceoName) : null;
     const supplement = buildSupplement(tier, census);
     console.log(`[scorer] tier=${tier}${mktCapB !== null ? `(${mktCapB}億)` : '(市值未知)'} 門檻=${threshold.total}` +

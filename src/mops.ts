@@ -63,6 +63,44 @@ function htmlToText(html: string): string {
 
 const thisRocYear = (): number => new Date().getFullYear() - 1911;
 
+export interface CompanyOfficers {
+  chairman: string | null;    // 董事長
+  president: string | null;   // 總經理
+  spokesperson: string | null; // 發言人
+  spokespersonTitle: string | null; // 發言人職稱（常見即實質 CEO 頭銜，如「執行長」）
+}
+
+/**
+ * 公司基本資料（t05st03）：董事長／總經理／發言人為結構化欄位，
+ * 遠比從新聞散文正則猜「執行長」姓名可靠——避免把職稱附近的無關詞句誤認成人名
+ * （曾誤判「...換三任總經理，也說明...」中的「也說明」為姓名）。
+ */
+export async function fetchCompanyOfficers(ticker: string): Promise<CompanyOfficers | null> {
+  try {
+    const html = await mopsPost('ajax_t05st03', { co_id: ticker, year: '', month: '', b_date: '', e_date: '' });
+    const text = htmlToText(html);
+    if (!text || /查無(?:相關)?資料/.test(text)) return null;
+
+    // htmlToText 把整份表格壓成純空白分隔的一行，欄位間無其他分隔符，
+    // 例如：「董事長 詹青柳 總經理 黃正谷 發言人 林國鐘 發言人職稱 執行長」。
+    // 姓名恰為標籤後第一個「不含空白」的 token，故只抓到下一個空白為止。
+    const grab = (label: string): string | null => {
+      const m = text.match(new RegExp(`${label}\\s+(\\S{1,20})`));
+      const v = m?.[1]?.trim();
+      return v && v !== '－' && v !== '-' ? v : null;
+    };
+
+    return {
+      chairman: grab('董事長'),
+      president: grab('總經理'),
+      spokesperson: grab('發言人'),
+      spokespersonTitle: grab('發言人職稱'),
+    };
+  } catch {
+    return null;
+  }
+}
+
 /** 財報是否真的有資料（避免「查無資料」空殼）。 */
 function looksLikeFinancials(text: string): boolean {
   return text.length > 600 && /(資產總額|營業收入|負債總額|本期淨利)/.test(text);
