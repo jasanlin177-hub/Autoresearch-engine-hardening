@@ -102,6 +102,22 @@ function cleanupTickerScoreAndGapsFiles(ticker: string): void {
   }
 }
 
+/**
+ * 每輪 agent 執行前，把主檔備份到 data/companies/{ticker}/history/。
+ * data/companies/*​/ 已被 gitignore，備份不進 git，但本機可回溯（彌補無版本歷史的問題）。
+ * label 例：r3、polish。無主檔時靜默略過。
+ */
+function backupMainFile(ticker: string, label: string): void {
+  const mainPath = path.join(PROJECT_ROOT, 'data', 'companies', ticker, `${ticker}_Initial_MAX.md`);
+  if (!fs.existsSync(mainPath)) return;
+  try {
+    const historyDir = path.join(PROJECT_ROOT, 'data', 'companies', ticker, 'history');
+    fs.mkdirSync(historyDir, { recursive: true });
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    fs.copyFileSync(mainPath, path.join(historyDir, `${ts}_${label}.md`));
+  } catch (_) {}
+}
+
 // ── TSV result tracking ──
 
 interface RoundResult {
@@ -1008,6 +1024,7 @@ async function main() {
   const force = args['force'] === 'true';
   const model = args.model ?? DEFAULT_MODEL;
   const engine = (args.engine ?? 'api') as 'api' | 'claude-cli' | 'codex';
+  const scorerEngine = (args['scorer-engine'] ?? 'api') as 'api' | 'claude-cli' | 'codex';
   const market = args.market ?? 'US';
   const investorNote = args.why ?? args.note ?? '';
   const tag = args.tag ?? new Date().toISOString().slice(5, 10).replace('-', '');
@@ -1060,7 +1077,7 @@ async function main() {
   // Baseline score
   console.log('\n═══ Baseline Scoring ═══');
   // 評分用強模型 SCORER_MODEL，與研究用的 model(Flash) 脫鉤，確保評分穩定。
-  const { score: baselineScore, gaps: baselineGaps } = await scoreCompanyResearch(ticker, 0, SCORER_MODEL, market);
+  const { score: baselineScore, gaps: baselineGaps } = await scoreCompanyResearch(ticker, 0, SCORER_MODEL, market, scorerEngine);
   const baselineResult: RoundResult = {
     round: 0,
     commit: gitShortHash(),
@@ -1106,6 +1123,7 @@ async function main() {
       }
 
       console.log(`Running gap-fill agent... [engine: ${engine}]`);
+      backupMainFile(ticker, `r${round}`);
       const { response: agentResponse, wroteToMainFile } =
         engine === 'claude-cli' ? await runClaudeCliAgent(ticker, gaps, round, 'gap_fill', lastRoundNoWrite)
         : engine === 'codex' ? await runCodexCliAgent(ticker, gaps, round, 'gap_fill', lastRoundNoWrite)
@@ -1129,7 +1147,7 @@ async function main() {
 
       // Score new state
       console.log('Scoring...');
-      const { score: newScore } = await scoreCompanyResearch(ticker, round, SCORER_MODEL, market);
+      const { score: newScore } = await scoreCompanyResearch(ticker, round, SCORER_MODEL, market, scorerEngine);
       const delta = newScore.total - prevScore;
       console.log(`Score: ${newScore.total}/100 (${delta >= 0 ? '+' : ''}${delta} from ${prevScore})`);
 
@@ -1189,6 +1207,7 @@ async function main() {
   if (!skipPolish && fs.existsSync(mainFilePath) && ranAtLeastOneResearchRound) {
     console.log('\n═══ Polish pass（主檔順稿／格式整理，無新研究）═══');
     try {
+      backupMainFile(ticker, 'pre-polish');
       const polishGaps: InitialMaxGaps = { round: polishRoundId, score: prevScore, gaps: [] };
       const { response: polishResp } =
         engine === 'claude-cli' ? await runClaudeCliAgent(ticker, polishGaps, polishRoundId, 'polish', false)
@@ -1201,7 +1220,7 @@ async function main() {
       } catch {}
       console.log(`Polish summary: ${polishDesc}`);
       console.log('Scoring after polish...');
-      const { score: afterPolish } = await scoreCompanyResearch(ticker, polishRoundId, SCORER_MODEL, market);
+      const { score: afterPolish } = await scoreCompanyResearch(ticker, polishRoundId, SCORER_MODEL, market, scorerEngine);
       console.log(`Score after polish: ${afterPolish.total}/100`);
       const commitHash = gitCommit(`initial-max polish: ${polishDesc.slice(0, 55)} — score ${afterPolish.total}/100`);
       history.push({

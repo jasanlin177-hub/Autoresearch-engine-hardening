@@ -8,6 +8,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
+import { buildPdfPrefetchAttachment } from './pdf-prefetch.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -55,13 +56,13 @@ function readMainFile(ticker: string): string {
   );
 }
 
-/** 組裝 gap-fill prompt（給 Claude CLI 的完整指令）。 */
-function buildGapFillPrompt(
+/** 組裝 gap-fill prompt（給 Claude CLI 的完整指令）。若主檔已含 PDF 連結，本機預先下載解析後一併附上。 */
+async function buildGapFillPrompt(
   ticker: string,
   gaps: InitialMaxGaps,
   round: number,
   noWriteWarning: boolean,
-): string {
+): Promise<string> {
   const today = new Date().toISOString().slice(0, 10);
   const mainFile = `${ticker}_Initial_MAX.md`;
   const mainFilePath = path.join(PROJECT_ROOT, 'data', 'companies', ticker, mainFile).replace(/\\/g, '/');
@@ -72,6 +73,9 @@ function buildGapFillPrompt(
   const noWriteAlert = noWriteWarning
     ? `\n> ⚠ **上輪未寫入任何內容到主檔。** 本輪取得資料後必須立即寫入，不得延後。\n`
     : '';
+
+  const mainFileText = readMainFile(ticker);
+  const pdfAttachment = await buildPdfPrefetchAttachment(ticker, mainFileText, PROJECT_ROOT);
 
   const prompt = `你是台股深度研究的投研編輯。你的任務是補強公司研究主檔的缺口。
 
@@ -96,10 +100,12 @@ ${topGaps}
    - 寫入時保留既有內容，只補缺口章節（# 標題層級請對齊主檔）
    - 所有數據、引用必須附 https:// 來源連結
 5. ⚠ **強制規定**：本輪必須至少執行一次 Write 或 Edit 寫入主檔，不得只研究不寫入。
+6. 若下方已附「預先下載的 PDF 全文」，直接引用其內容，**不要**再自行嘗試抓取同一個 PDF 連結（該站台會擋掉非瀏覽器請求）。
+7. ⚠ **禁止把過程紀錄寫進主檔正文**：不得出現「第 N 輪補強」「本輪新增」「更新後…覆蓋率由 X 提升至 Y」這類 changelog／meta 敘述。主檔只留**最終研究結論**（事實、數字、引言、來源連結）；你這輪做了什麼一律寫進最後那行 JSON 的 description，不要寫進正文。
 
 ### 完成後輸出 JSON（最後一行）：
-{"description": "補充了哪些內容", "sections_written": ["1.1", "2.2"], "interviews_added": 數字}
-${readMainFile(ticker)}`;
+{"description": "補充了哪些內容（過程紀錄只寫這裡，不寫主檔正文）", "sections_written": ["1.1", "2.2"], "interviews_added": 數字}
+${mainFileText}${pdfAttachment}`;
 
   return prompt;
 }
@@ -197,7 +203,7 @@ export async function runClaudeCliAgent(
 
   const prompt = phase === 'polish'
     ? buildPolishPrompt(ticker, gaps.score)
-    : buildGapFillPrompt(ticker, gaps, round, noWriteWarning);
+    : await buildGapFillPrompt(ticker, gaps, round, noWriteWarning);
 
   const result = await spawnClaude(prompt);
 

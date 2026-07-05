@@ -10,6 +10,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { spawn } from 'child_process';
 import { chat, geminiGenerateContent } from './llm.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -135,7 +136,12 @@ function readResearchFiles(ticker: string): string {
         const fullPath = path.join(dir, f);
         try {
           const content = fs.readFileSync(fullPath, 'utf-8');
-          collected.push(`\n\n=== ${f} ===\n${content.slice(0, 15000)}`);
+          // 主檔（{ticker}_Initial_MAX.md）是唯一權威來源，不做每檔 15000 字元截斷，
+          // 否則報告一旦超過 15000 字元，後段章節（常是三、組織／四、人）永遠評不到。
+          // 舊版輔助檔（initial_*.md 等）仍截斷 15000，避免多檔案疊加撐爆下游 80000 字元總長度上限。
+          const isMainFile = f === `${ticker}_Initial_MAX.md`;
+          const slice = isMainFile ? content : content.slice(0, 15000);
+          collected.push(`\n\n=== ${f} ===\n${slice}`);
         } catch {}
       }
     }
@@ -331,6 +337,11 @@ function heuristicScore(ticker: string, threshold: TierThreshold = TIER_THRESHOL
 const SCORER_SYSTEM_PROMPT = `你是一位專業的投資研究品質評審。請根據張磊（高瓴資本）「環境→生意→組織→人」投資研究框架，對以下公司研究報告進行**嚴格**評分。
 
 **達標條件（須全部滿足）**：總分 ≥ **95 分**，且各維度達最低分：環境≥16、生意≥30、組織≥16、人≥20；**缺「2.5 DCF 估值」小節（情境表/三表/IRR 或 dcf_config）則生意維度不得達標**（DCF 為必達項）。**每個子節（1.1～4.2）皆須有實質內容**，缺一則不達標。
+
+**⚠️ 「給分（score）」與「達標（pass/fail）」是兩件獨立的事，評分時嚴禁混淆**：
+- 上述「達標條件」只決定最終 pass/fail，**完全不影響任何維度給幾分**。子節不完整（如 2.3、2.4、3.2、3.3、4.2 為「待補充」）只讓報告「不達標」，**不得**因此再去扣減維度分。
+- 各維度的 score **只依該維度下方列出的給分子項評分**。若某「待補充」子節恰好對應到某個給分子項，就讓**那一個子項**給 0；**不得**連帶扣減同維度其他已完成子項的分數。
+- 反向亦然：某給分子項對應的內容為空（如 3.2/3.3 空 → 組織的「組織文化」「運營效率」兩項給 0），該子項就給 0，**不得**因同維度其他子項（如 3.4 地理分部）表現優秀而把分數「外溢」拉高。每個給分子項各自獨立評，各給各的。
 **內容深度**：**環境**須從**該產業的起源或現代形態起點**論述（例如廣告業從現代廣告誕生開始）；**4.1 CEO/創業家**須從**學經歷**開始，含**重要拐點、重要成就、每個時期的訪談**、**成功與失敗的檢討與反思**；不足者扣分。
 
 ## 評分框架（100分）
@@ -494,6 +505,75 @@ function buildSupplement(tier: CapTier, census: number | null): string {
   return `\n\n---\n## ⚠️ 本次評分附加條款\n\n` + parts.join('\n\n');
 }
 
+function extractOutermostJson(text: string): string | null {
+  // 1. code fence
+  const fenceMatch = text.match(/```(?:json)?\s*\n?([\s\S]*?)```/);
+  if (fenceMatch) return fenceMatch[1].trim();
+  // 2. 從尾找最後一個完整 {} 含評分 key
+  let depth = 0;
+  for (let i = text.length - 1; i >= 0; i--) {
+    if (text[i] === '}') depth++;
+    else if (text[i] === '{') {
+      depth--;
+      if (depth === 0) {
+        const candidate = text.slice(i);
+        if (/環境|生意|組織|人/.test(candidate)) return candidate;
+        depth = 0; // 不符合，繼續往前找
+      }
+    }
+  }
+  // 3. 最後備用：首個 {
+  const s = text.indexOf('{');
+  return s !== -1 ? text.slice(s) : null;
+}
+
+/** 把評分 LLM 的原始文字回應解析成 InitialMaxScore；API/CLI 兩路徑共用。 */
+function parseScoreResponse(rawText: string, threshold: TierThreshold): InitialMaxScore | null {
+  const extracted = extractOutermostJson(rawText.trim());
+  if (!extracted) {
+    console.warn(`[scorer] No JSON found in response (first 200 chars): ${rawText.slice(0, 200)}`);
+    return null;
+  }
+
+  // Find outermost { } bounds within the extracted string
+  let depth2 = 0;
+  let end = -1;
+  for (let i = 0; i < extracted.length; i++) {
+    if (extracted[i] === '{') depth2++;
+    else if (extracted[i] === '}') { depth2--; if (depth2 === 0) { end = i; break; } }
+  }
+  if (end === -1) return null;
+
+  const parsed = JSON.parse(extracted.slice(0, end + 1));
+  const total = parsed.total ?? (
+    (parsed['環境']?.score ?? 0) +
+    (parsed['生意']?.score ?? 0) +
+    (parsed['組織']?.score ?? 0) +
+    (parsed['人']?.score ?? 0)
+  );
+
+  const 環境 = parsed['環境']?.score ?? 0;
+  const 生意 = parsed['生意']?.score ?? 0;
+  const 組織 = parsed['組織']?.score ?? 0;
+  const 人 = parsed['人']?.score ?? 0;
+  const passThreshold =
+    total >= threshold.total &&
+    環境 >= threshold.環境 &&
+    生意 >= threshold.生意 &&
+    組織 >= threshold.組織 &&
+    人 >= threshold.人;
+
+  return {
+    環境: { score: 環境, max: 20, criteria: parsed['環境']?.criteria, gaps: parsed['環境']?.gaps ?? [] },
+    生意: { score: 生意, max: 35, criteria: parsed['生意']?.criteria, gaps: parsed['生意']?.gaps ?? [] },
+    組織: { score: 組織, max: 20, criteria: parsed['組織']?.criteria, gaps: parsed['組織']?.gaps ?? [] },
+    人: { score: 人, max: 25, criteria: parsed['人']?.criteria, gaps: parsed['人']?.gaps ?? [] },
+    total,
+    passThreshold,
+    round: 0,
+  };
+}
+
 async function llmScore(
   ticker: string,
   reportContent: string,
@@ -539,75 +619,115 @@ ${reportContent.slice(0, 80000)}`;
       return null;
     }
 
-    function extractOutermostJson(text: string): string | null {
-      // 1. code fence
-      const fenceMatch = text.match(/```(?:json)?\s*\n?([\s\S]*?)```/);
-      if (fenceMatch) return fenceMatch[1].trim();
-      // 2. 從尾找最後一個完整 {} 含評分 key
-      let depth = 0;
-      for (let i = text.length - 1; i >= 0; i--) {
-        if (text[i] === '}') depth++;
-        else if (text[i] === '{') {
-          depth--;
-          if (depth === 0) {
-            const candidate = text.slice(i);
-            if (/環境|生意|組織|人/.test(candidate)) return candidate;
-            depth = 0; // 不符合，繼續往前找
-          }
-        }
-      }
-      // 3. 最後備用：首個 {
-      const s = text.indexOf('{');
-      return s !== -1 ? text.slice(s) : null;
-    }
-
-    const extracted = extractOutermostJson(rawText.trim());
-    if (!extracted) {
-      console.warn(`[scorer] No JSON found in response (first 200 chars): ${rawText.slice(0, 200)}`);
-      return null;
-    }
-
-    // Find outermost { } bounds within the extracted string
-    let depth2 = 0;
-    let end = -1;
-    for (let i = 0; i < extracted.length; i++) {
-      if (extracted[i] === '{') depth2++;
-      else if (extracted[i] === '}') { depth2--; if (depth2 === 0) { end = i; break; } }
-    }
-    if (end === -1) return null;
-
-    const parsed = JSON.parse(extracted.slice(0, end + 1));
-    const total = parsed.total ?? (
-      (parsed['環境']?.score ?? 0) +
-      (parsed['生意']?.score ?? 0) +
-      (parsed['組織']?.score ?? 0) +
-      (parsed['人']?.score ?? 0)
-    );
-
-    const 環境 = parsed['環境']?.score ?? 0;
-    const 生意 = parsed['生意']?.score ?? 0;
-    const 組織 = parsed['組織']?.score ?? 0;
-    const 人 = parsed['人']?.score ?? 0;
-    const passThreshold =
-      total >= threshold.total &&
-      環境 >= threshold.環境 &&
-      生意 >= threshold.生意 &&
-      組織 >= threshold.組織 &&
-      人 >= threshold.人;
-
-    return {
-      環境: { score: 環境, max: 20, criteria: parsed['環境']?.criteria, gaps: parsed['環境']?.gaps ?? [] },
-      生意: { score: 生意, max: 35, criteria: parsed['生意']?.criteria, gaps: parsed['生意']?.gaps ?? [] },
-      組織: { score: 組織, max: 20, criteria: parsed['組織']?.criteria, gaps: parsed['組織']?.gaps ?? [] },
-      人: { score: 人, max: 25, criteria: parsed['人']?.criteria, gaps: parsed['人']?.gaps ?? [] },
-      total,
-      passThreshold,
-      round: 0,
-    };
+    return parseScoreResponse(rawText, threshold);
   } catch (err: any) {
     console.error('LLM scorer error:', err.message);
     return null;
   }
+}
+
+/**
+ * 以 Claude/Codex CLI 執行單次評分（scoring-only，無工具存取，純文字進 JSON 出）。
+ * 不給檔案讀寫/網路搜尋權限：report 已內嵌在 prompt，CLI 只需判讀+輸出 JSON，
+ * 應遠快於研究輪（無需 web_search/write），也不會產生副作用。
+ */
+async function llmScoreViaCli(
+  ticker: string,
+  reportContent: string,
+  engine: 'claude-cli' | 'codex',
+  supplement: string,
+  threshold: TierThreshold,
+): Promise<InitialMaxScore | null> {
+  const systemPrompt = SCORER_SYSTEM_PROMPT + supplement;
+  const userMessage = `請評分以下 ${ticker} 的研究報告：\n\n${reportContent.slice(0, 80000)}`;
+  const fullPrompt = `${systemPrompt}\n\n---\n\n${userMessage}`;
+
+  try {
+    const rawText = engine === 'claude-cli'
+      ? await spawnClaudeScorer(fullPrompt)
+      : await spawnCodexScorer(fullPrompt);
+    if (!rawText) {
+      console.warn(`[scorer] ${engine} returned null/empty content`);
+      return null;
+    }
+    return parseScoreResponse(rawText, threshold);
+  } catch (err: any) {
+    console.error(`[scorer] ${engine} scorer error:`, err.message);
+    return null;
+  }
+}
+
+/** `claude -p`，關閉所有工具（--tools ""）+ --bare 加速，只做純文字判讀。 */
+async function spawnClaudeScorer(prompt: string, timeoutMs = 120_000): Promise<string | null> {
+  return new Promise((resolve, reject) => {
+    const args = ['-p', prompt, '--output-format', 'json', '--tools', '', '--bare'];
+    const proc = spawn('claude', args, {
+      cwd: PROJECT_ROOT,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env },
+    });
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', (d: Buffer) => { stdout += d.toString(); });
+    proc.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
+    const timer = setTimeout(() => { proc.kill(); reject(new Error(`claude scorer timed out after ${timeoutMs / 1000}s`)); }, timeoutMs);
+    proc.on('close', (code) => {
+      clearTimeout(timer);
+      if (code !== 0 && !stdout) { reject(new Error(`claude scorer exited ${code}: ${stderr.slice(0, 200)}`)); return; }
+      try {
+        const parsed = JSON.parse(stdout.trim());
+        resolve(parsed.is_error ? null : (parsed.result ?? null));
+      } catch {
+        resolve(stdout.trim() || null);
+      }
+    });
+    proc.on('error', (err) => { clearTimeout(timer); reject(new Error(`Failed to spawn claude: ${err.message}`)); });
+  });
+}
+
+/** `codex exec`，read-only 沙盒（無寫入/網路搜尋），prompt 走 stdin，只做純文字判讀。 */
+async function spawnCodexScorer(prompt: string, timeoutMs = 120_000): Promise<string | null> {
+  return new Promise((resolve, reject) => {
+    const isWin = process.platform === 'win32';
+    const codexBin = isWin ? 'codex.cmd' : 'codex';
+    const command = [codexBin, 'exec', '--json', '--skip-git-repo-check', '-C', isWin ? `"${PROJECT_ROOT}"` : PROJECT_ROOT, '-s', 'read-only'].join(' ');
+    const proc = spawn(command, {
+      cwd: PROJECT_ROOT,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      shell: true,
+      env: { ...process.env },
+    });
+    proc.stdin.write(prompt);
+    proc.stdin.end();
+
+    let stderr = '';
+    let lastAgentMessage = '';
+    let buffer = '';
+    proc.stdout.on('data', (d: Buffer) => {
+      buffer += d.toString();
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+      for (const line of lines) {
+        const t = line.trim();
+        if (!t) continue;
+        try {
+          const ev = JSON.parse(t);
+          if (ev.type === 'item.completed' && ev.item?.type === 'agent_message') {
+            lastAgentMessage = ev.item.text ?? lastAgentMessage;
+          }
+        } catch { /* 非 JSON 行忽略 */ }
+      }
+    });
+    proc.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
+
+    const timer = setTimeout(() => { proc.kill(); reject(new Error(`codex scorer timed out after ${timeoutMs / 1000}s`)); }, timeoutMs);
+    proc.on('close', (code) => {
+      clearTimeout(timer);
+      if (code !== 0 && !lastAgentMessage) { reject(new Error(`codex scorer exited ${code}: ${stderr.slice(0, 200)}`)); return; }
+      resolve(lastAgentMessage || null);
+    });
+    proc.on('error', (err) => { clearTimeout(timer); reject(new Error(`Failed to spawn codex: ${err.message}`)); });
+  });
 }
 
 /**
@@ -620,10 +740,14 @@ async function medianLlmScore(
   model: string,
   supplement: string,
   threshold: TierThreshold,
+  scorerEngine: 'api' | 'claude-cli' | 'codex' = 'api',
 ): Promise<InitialMaxScore | null> {
   const runs = await Promise.all(
     Array.from({ length: SCORER_SAMPLES }, () =>
-      llmScore(ticker, reportContent, model, supplement, threshold).catch(() => null),
+      (scorerEngine === 'api'
+        ? llmScore(ticker, reportContent, model, supplement, threshold)
+        : llmScoreViaCli(ticker, reportContent, scorerEngine, supplement, threshold)
+      ).catch(() => null),
     ),
   );
   const valid = runs.filter((r): r is InitialMaxScore => r !== null);
@@ -697,6 +821,7 @@ export async function scoreCompanyResearch(
   round = 0,
   model = SCORER_MODEL,
   market = 'US',
+  scorerEngine: 'api' | 'claude-cli' | 'codex' = 'api',
 ): Promise<{ score: InitialMaxScore; gaps: InitialMaxGaps }> {
   const reportContent = readResearchFiles(ticker);
   const dir = getCompanyDir(ticker);
@@ -731,9 +856,10 @@ export async function scoreCompanyResearch(
     console.log(`[scorer] tier=${tier}${mktCapB !== null ? `(${mktCapB}億)` : '(市值未知)'} 門檻=${threshold.total}` +
       (census !== null ? ` 證據普查:${ceoName}≈${census}篇` : ''));
 
-    // Try LLM scorer（並行取樣取中位數，抵消 flash 底噪）
-    console.log(`[scorer] Running LLM scorer (${model} ×${SCORER_SAMPLES}) for ${ticker}...`);
-    const llmResult = await medianLlmScore(ticker, reportContent, model, supplement, threshold);
+    // Try LLM scorer（並行取樣取中位數，抵消底噪；scorerEngine 決定走 API 或 CLI）
+    const scorerLabel = scorerEngine === 'api' ? model : `${scorerEngine} (CLI)`;
+    console.log(`[scorer] Running LLM scorer (${scorerLabel} ×${SCORER_SAMPLES}) for ${ticker}...`);
+    const llmResult = await medianLlmScore(ticker, reportContent, model, supplement, threshold, scorerEngine);
 
     if (llmResult) {
       score = { ...llmResult, round };
@@ -792,8 +918,9 @@ async function main() {
   const model = args.model ?? SCORER_MODEL;
   const round = parseInt(args.round ?? '0', 10);
   const market = args.market ?? 'US';
+  const scorerEngine = (args['scorer-engine'] ?? 'api') as 'api' | 'claude-cli' | 'codex';
 
-  const { score } = await scoreCompanyResearch(ticker.toUpperCase(), round, model, market);
+  const { score } = await scoreCompanyResearch(ticker.toUpperCase(), round, model, market, scorerEngine);
 
   // 門檻依市值分級（large≥95 / mid≥75 / small≥60），由 scorer log 印出實際 tier。
   const passLabel = '依市值分級門檻（見上方 tier 行）';
