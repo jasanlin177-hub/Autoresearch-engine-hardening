@@ -22,6 +22,8 @@ import path from 'path';
 import { execSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { chat, type Message, type ToolDef, type ToolCall } from './llm.js';
+import { runClaudeCliAgent } from './claude-cli-runner.js';
+import { runCodexCliAgent } from './codex-cli-runner.js';
 import { scoreCompanyResearch, SCORER_MODEL, type InitialMaxScore, type InitialMaxGaps } from './initial-max-scorer.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -194,19 +196,22 @@ async function fetchUrl(url: string): Promise<string> {
   }
 }
 
-async function fetchOfficialDisclosureTool(ticker: string, types?: string[]): Promise<string> {
+async function fetchOfficialDisclosureTool(ticker: string, types?: string[], market = 'TW'): Promise<string> {
   const { fetchOfficialDisclosure } = await import('./mops.js');
-  const docs = await fetchOfficialDisclosure(ticker, types as any);
+  const docs = await fetchOfficialDisclosure(ticker, types as any, market);
   if (!docs.length) return JSON.stringify({ status: 'no_docs', ticker });
+  const saved: { type: string; title: string; chars: number; savedFile: string }[] = [];
   for (const doc of docs) {
     const safeName = doc.date.replace(/\//g, '') || 'unknown';
     const filename = `official/${doc.type}_${safeName}.md`;
     writeResearchSection(ticker, filename, `# ${doc.title}\n\n${doc.text}`, 'overwrite');
+    saved.push({ type: doc.type, title: doc.title, chars: doc.chars, savedFile: filename });
   }
   return JSON.stringify({
     status: 'fetched',
     ticker,
-    docs: docs.map(d => ({ type: d.type, title: d.title, chars: d.chars })),
+    docs: saved,
+    hint: 'Use read_research_file with savedFile path to read the content.',
   });
 }
 
@@ -778,7 +783,9 @@ async function runGapFillAgent(
   model: string,
   investorNote?: string,
   phase: 'gap_fill' | 'polish' = 'gap_fill',
-): Promise<string> {
+  market = 'TW',
+  noWriteWarning = false,
+): Promise<{ response: string; wroteToMainFile: boolean }> {
   const today = new Date().toISOString().slice(0, 10);
   const mainFile = `${ticker}_Initial_MAX.md`;
   const tools = phase === 'polish' ? POLISH_TOOLS : GAP_FILL_TOOLS;
@@ -808,7 +815,10 @@ async function runGapFillAgent(
 **輸出格式**（工具完成後）：
 {"description": "polished 1.1–2.3, fixed ## headings, deduped 4.1", "files_written": ["${mainFile}"], "interviews_added": 0, "dimensions_addressed": ["polish"]}`;
   } else {
-    taskMessage = `## ${ticker} 研究缺口補充任務（第 ${round} 輪，${today}）
+    const noWriteAlert = noWriteWarning
+      ? `\n> ⚠ **上輪未寫入任何內容到主檔。** 本輪取得資料後必須立即寫入 \`${mainFile}\`，不得延後。\n`
+      : '';
+    taskMessage = `## ${ticker} 研究缺口補充任務（第 ${round} 輪，${today}）${noWriteAlert}
 
 **當前分數**：${gaps.score}/100（目標 **≥95/100**，且各維度達最低分、2.5 DCF 必達）
 
@@ -822,6 +832,7 @@ ${topGaps}
 1. 依**優先缺口**決定本輪補哪 1～2 個維度；缺財報→ninja_api(earnings_historical)；缺法說→ninja_api(earningstranscript) 或 fetch_url；缺管理層原話→可 search_data_for_company 再 read_project_file 摘錄。
 2. web_search 最多 5 次，留給真正需要搜尋的缺口。
 3. 寫入主檔 \`${mainFile}\` 時：對照文末全文後，以 \`replace_section\`（整節重寫／修正）為主，\`insert_into_section\` 為輔；禁止 append 堆文末。
+⚠ **強制規定**：每輪在所有資料取得後，**必須**至少呼叫一次 \`write_research_section\` 寫入主檔，否則本輪研究無效。**不得**以「稍後整合」或「資料格式不符」為由延後或跳過寫入。若資料品質不佳，仍須將現有資料整理後寫入，並在內文標注「待補充」。
 4. **資料來源連結（本輪必守）**：凡本輪新增／改寫的數據、表格註、監管與市場敘述、訪談與財報引用，**須附可點擊 \`https://\` 連結**（Markdown 連結或裸 URL）；**禁止**只寫「10-K」「年報」「某機構報告」等名稱而無 URL。訪談用原文 URL；年報用 SEC／IR 文件連結；已下載逐字稿可連 \`transcripts/檔名\`。
 5. 地理/業務分部須標年報或法說出處（含連結）；每子點至少 5 則管理層原話（引號+出處+日期+訪談／逐字稿 **URL**）。
 6. 完成後輸出 JSON summary（見下方格式）${investorSection}
@@ -852,6 +863,7 @@ ${topGaps}
   const MAX_SEARCH = 5;
   const MAX_TOOL_ROUNDS = 20;
   let finalResponse = '';
+  let wroteToMainFile = false;
 
   // Polish 階段防 loop：每個 section_anchor 只允許 replace 一次。
   // 否則模型會反覆 replace_section 同一節（觀察到單節被改寫 15 次），徒增成本與損壞風險。
@@ -898,6 +910,18 @@ ${topGaps}
           result = await fetchUrl(args.url ?? '');
           break;
         case 'write_research_section': {
+          const allowedMainFile = `${args.ticker ?? ticker}_Initial_MAX.md`;
+          const requestedFile = String(args.filename ?? '').trim();
+          if (!requestedFile) {
+            console.log(`  [write] (blocked) filename 為空，主檔必須為 ${allowedMainFile}`);
+            result = JSON.stringify({ error: `filename 不得為空，主檔必須為 ${allowedMainFile}，附屬檔案請放在 transcripts/ 子目錄。` });
+            break;
+          }
+          if (requestedFile !== allowedMainFile && !requestedFile.startsWith('transcripts/')) {
+            console.log(`  [write] (blocked) 非法 filename "${requestedFile}"，只允許 ${allowedMainFile} 或 transcripts/*`);
+            result = JSON.stringify({ error: `非法 filename "${requestedFile}"，主檔必須為 ${allowedMainFile}，附屬檔案請放在 transcripts/ 子目錄。` });
+            break;
+          }
           const wMode = (args.mode as 'append' | 'overwrite' | 'insert_into_section' | 'replace_section') ?? 'append';
           const wAnchor = args.section_anchor as string | undefined;
           // Polish 防 loop：同一節已 replace 過就拒絕，要求模型換節或結束。
@@ -917,6 +941,10 @@ ${topGaps}
             wAnchor
           );
           if (phase === 'polish' && wMode === 'replace_section' && wAnchorKey) polishedAnchors.add(wAnchorKey);
+          // 只要本輪有成功寫入主檔（非 transcripts/），就標記為已寫入
+          if (phase === 'gap_fill' && !requestedFile.startsWith('transcripts/')) {
+            wroteToMainFile = true;
+          }
           break;
         }
         case 'read_research_file':
@@ -944,7 +972,7 @@ ${topGaps}
           break;
         case 'fetch_official_disclosure':
           console.log(`  [mops] ${args.ticker ?? ticker} types=${JSON.stringify(args.types ?? [])}`);
-          result = await fetchOfficialDisclosureTool(args.ticker ?? ticker, args.types);
+          result = await fetchOfficialDisclosureTool(args.ticker ?? ticker, args.types, market ?? 'TW');
           break;
         default:
           result = JSON.stringify({ error: `Unknown tool: ${tc.function.name}` });
@@ -960,7 +988,7 @@ ${topGaps}
     }
   }
 
-  return finalResponse || '(no response)';
+  return { response: finalResponse || '(no response)', wroteToMainFile };
 }
 
 // ── Main loop ──
@@ -979,6 +1007,7 @@ async function main() {
   const skipPolish = args['skip-polish'] === 'true';
   const force = args['force'] === 'true';
   const model = args.model ?? DEFAULT_MODEL;
+  const engine = (args.engine ?? 'api') as 'api' | 'claude-cli' | 'codex';
   const market = args.market ?? 'US';
   const investorNote = args.why ?? args.note ?? '';
   const tag = args.tag ?? new Date().toISOString().slice(5, 10).replace('-', '');
@@ -1062,6 +1091,7 @@ async function main() {
   const history: RoundResult[] = [baselineResult];
   let prevScore = baselineScore.total;
   let plateauCount = 0;
+  let lastRoundNoWrite = false;
 
   for (let round = 1; round <= maxRounds; round++) {
     console.log(`\n═══ Round ${round}/${maxRounds} (current: ${prevScore}/100) ═══`);
@@ -1075,8 +1105,16 @@ async function main() {
         gaps = JSON.parse(fs.readFileSync(gapsPath, 'utf-8'));
       }
 
-      console.log('Running gap-fill agent...');
-      const agentResponse = await runGapFillAgent(ticker, gaps, skillContent, programPrompt, round, model, investorNote);
+      console.log(`Running gap-fill agent... [engine: ${engine}]`);
+      const { response: agentResponse, wroteToMainFile } =
+        engine === 'claude-cli' ? await runClaudeCliAgent(ticker, gaps, round, 'gap_fill', lastRoundNoWrite)
+        : engine === 'codex' ? await runCodexCliAgent(ticker, gaps, round, 'gap_fill', lastRoundNoWrite)
+        : await runGapFillAgent(ticker, gaps, skillContent, programPrompt, round, model, investorNote, 'gap_fill', market, lastRoundNoWrite);
+
+      if (!wroteToMainFile) {
+        console.log(`  [warn] 本輪未寫入主檔`);
+      }
+      lastRoundNoWrite = !wroteToMainFile;
 
       // Parse agent summary
       let description = `round ${round} gap-fill`;
@@ -1152,16 +1190,10 @@ async function main() {
     console.log('\n═══ Polish pass（主檔順稿／格式整理，無新研究）═══');
     try {
       const polishGaps: InitialMaxGaps = { round: polishRoundId, score: prevScore, gaps: [] };
-      const polishResp = await runGapFillAgent(
-        ticker,
-        polishGaps,
-        skillContent,
-        programPrompt,
-        polishRoundId,
-        model,
-        investorNote,
-        'polish',
-      );
+      const { response: polishResp } =
+        engine === 'claude-cli' ? await runClaudeCliAgent(ticker, polishGaps, polishRoundId, 'polish', false)
+        : engine === 'codex' ? await runCodexCliAgent(ticker, polishGaps, polishRoundId, 'polish', false)
+        : await runGapFillAgent(ticker, polishGaps, skillContent, programPrompt, polishRoundId, model, investorNote, 'polish', market);
       let polishDesc = 'polish pass';
       try {
         const jsonMatch = polishResp.match(/\{[\s\S]*"description"[\s\S]*\}/);

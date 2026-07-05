@@ -1,0 +1,238 @@
+/**
+ * codex-cli-runner.ts
+ * 以 OpenAI Codex CLI (`codex exec --json`) 執行 gap-fill agent。
+ * 吃 ChatGPT 訂閱額度（auth_mode: chatgpt），不走 API 計費。
+ *
+ * 與 claude-cli-runner.ts 介面相容，差異僅在：
+ *  - spawn `codex exec` 而非 `claude -p`
+ *  - 輸出為 JSONL 串流（逐行解析），非單一 JSON
+ */
+
+import * as fs from 'fs';
+import * as path from 'path';
+import { spawn } from 'child_process';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const PROJECT_ROOT = path.resolve(__dirname, '..');
+
+export interface InitialMaxGaps {
+  round: number;
+  score: number;
+  gaps: Array<{
+    dimension: string;
+    item: string;
+    current: string | number;
+    target: string | number;
+    shortfall: string | number;
+  }>;
+}
+
+interface CliResult {
+  response: string;
+  inputTokens?: number;
+  outputTokens?: number;
+}
+
+/** 取得主檔的最後修改時間（mtime），用於判斷本輪是否有寫入。 */
+function getMainFileMtime(ticker: string): number {
+  const p = path.join(PROJECT_ROOT, 'data', 'companies', ticker, `${ticker}_Initial_MAX.md`);
+  try { return fs.statSync(p).mtimeMs; } catch { return 0; }
+}
+
+/** 讀取主檔全文（供附在 prompt 末尾供 Codex 對照）。 */
+function readMainFile(ticker: string): string {
+  const mainFile = `${ticker}_Initial_MAX.md`;
+  const p = path.join(PROJECT_ROOT, 'data', 'companies', ticker, mainFile);
+  if (!fs.existsSync(p)) {
+    return `\n\n---\n\n## 當前主檔\n\n（尚無 \`${mainFile}\`，請建立完整主檔骨架後再逐輪補強。）\n`;
+  }
+  const raw = fs.readFileSync(p, 'utf-8');
+  const MAX = 60_000;
+  const truncated = raw.length > MAX;
+  const shown = truncated ? raw.slice(0, MAX) : raw;
+  return (
+    `\n\n---\n\n## 當前 \`${mainFile}\` 原文（供對照）\n\n` +
+    (truncated ? `_（此檔共 ${raw.length.toLocaleString()} 字元，以下僅前 ${MAX.toLocaleString()} 字元）_\n\n` : '') +
+    `---BEGIN_${ticker}_INITIAL_MAX---\n${shown}\n---END_${ticker}_INITIAL_MAX---`
+  );
+}
+
+/** 組裝 gap-fill prompt。 */
+function buildGapFillPrompt(
+  ticker: string,
+  gaps: InitialMaxGaps,
+  round: number,
+  noWriteWarning: boolean,
+): string {
+  const today = new Date().toISOString().slice(0, 10);
+  const mainFile = `${ticker}_Initial_MAX.md`;
+  const mainFilePath = path.join(PROJECT_ROOT, 'data', 'companies', ticker, mainFile).replace(/\\/g, '/');
+  const topGaps = gaps.gaps.slice(0, 5).map((g, i) =>
+    `${i + 1}. 【${g.dimension}】${g.item}：現況 ${g.current}，目標 ${g.target}，缺 ${g.shortfall} 分`,
+  ).join('\n');
+
+  const noWriteAlert = noWriteWarning
+    ? `\n> ⚠ **上輪未寫入任何內容到主檔。** 本輪取得資料後必須立即寫入，不得延後。\n`
+    : '';
+
+  return `你是台股深度研究的投研編輯。你的任務是補強公司研究主檔的缺口。
+
+## ${ticker} 研究缺口補充任務（第 ${round} 輪，${today}）${noWriteAlert}
+
+**當前分數**：${gaps.score}/100（目標 ≥95/100）
+
+### 優先缺口（依缺分高低排列）：
+${topGaps}
+
+### 工作目標：
+主檔路徑：\`${mainFilePath}\`
+
+### 任務指示：
+1. 先讀取主檔，了解現有內容，避免重複。
+2. 依優先缺口決定本輪補哪 1～2 個維度：
+   - 缺財報數據 → 用 web_search 搜尋，或 curl 抓 MOPS 財報
+   - 缺管理層原話 → web_search 搜尋 CEO 訪談
+   - 缺產業 TAM → web_search 搜尋市場規模報告
+3. web_search 最多 5 次，只用於真正需要補的缺口。
+4. 取得資料後，**立即**將整理後的內容寫入主檔對應章節（保留既有內容，只補缺口章節，# 標題層級對齊主檔）。
+   - 所有數據、引用必須附 https:// 來源連結
+5. ⚠ **強制規定**：本輪必須至少寫入主檔一次，不得只研究不寫入。
+
+### 完成後在最後輸出一行 JSON：
+{"description": "補充了哪些內容", "sections_written": ["1.1", "2.2"], "interviews_added": 數字}
+${readMainFile(ticker)}`;
+}
+
+/** 組裝 polish prompt。 */
+function buildPolishPrompt(ticker: string, score: number): string {
+  const today = new Date().toISOString().slice(0, 10);
+  const mainFilePath = path.join(PROJECT_ROOT, 'data', 'companies', ticker, `${ticker}_Initial_MAX.md`).replace(/\\/g, '/');
+
+  return `你是台股深度研究的投研編輯。本輪只做整理，不研究新內容。
+
+## ${ticker} 研究主檔整理輪（${today}，分數 ${score}/100）
+
+主檔路徑：\`${mainFilePath}\`
+
+### 必做：
+1. 讀取主檔全文
+2. 刪除重複段落、重複表格、重複引言
+3. 段落銜接順暢、標題層級一致、表格格式合法
+4. 修正錯字與語病，保留所有數字、連結、出處
+5. 寫回主檔（必須執行，不可只讀不寫）
+
+### 完成後在最後輸出一行 JSON：
+{"description": "polish 整理摘要", "sections_polished": ["1.1", "4.1"]}`;
+}
+
+/** 執行 `codex exec --json`，解析 JSONL 串流，回傳結果。 */
+async function spawnCodex(prompt: string, timeoutMs = 900_000): Promise<CliResult> {
+  return new Promise((resolve, reject) => {
+    // prompt 不走命令列（含換行/引號會被 shell 破壞），改由 stdin 傳入。
+    // Windows 上 codex 是 .cmd 包裝，直接 spawn 會 EINVAL，必須經 shell。
+    // 為避免「shell:true + args 陣列」的跳脫警告，這裡組成單一命令字串（無外部輸入，皆為常數），
+    // 交給 spawn 的 shell:true 走 cmd.exe /c 執行；prompt 一律走 stdin，不進入這個字串。
+    const isWin = process.platform === 'win32';
+    const codexBin = isWin ? 'codex.cmd' : 'codex';
+    const quotedRoot = isWin ? `"${PROJECT_ROOT}"` : PROJECT_ROOT;
+    const command = [
+      codexBin,
+      'exec', '--json', '--skip-git-repo-check',
+      '-C', quotedRoot,
+      '-s', 'workspace-write',
+      '-c', 'tools.web_search=true',
+    ].join(' ');
+
+    const proc = spawn(command, {
+      cwd: PROJECT_ROOT,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      shell: true,
+      env: { ...process.env },
+    });
+
+    // prompt 透過 stdin 傳入後關閉
+    proc.stdin.write(prompt);
+    proc.stdin.end();
+
+    let stdout = '';
+    let stderr = '';
+    let lastAgentMessage = '';
+    let usage: { input_tokens?: number; output_tokens?: number } = {};
+    let buffer = '';
+
+    proc.stdout.on('data', (d: Buffer) => {
+      stdout += d.toString();
+      buffer += d.toString();
+      // 逐行解析 JSONL：agent_message 取 text，turn.completed 取 usage
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+      for (const line of lines) {
+        const t = line.trim();
+        if (!t) continue;
+        try {
+          const ev = JSON.parse(t);
+          if (ev.type === 'item.completed' && ev.item?.type === 'agent_message') {
+            lastAgentMessage = ev.item.text ?? lastAgentMessage;
+          } else if (ev.type === 'turn.completed' && ev.usage) {
+            usage = ev.usage;
+          }
+        } catch { /* 非 JSON 行忽略 */ }
+      }
+    });
+    proc.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
+
+    const timer = setTimeout(() => {
+      proc.kill();
+      reject(new Error(`codex CLI timed out after ${timeoutMs / 1000}s`));
+    }, timeoutMs);
+
+    proc.on('close', (code) => {
+      clearTimeout(timer);
+      if (code !== 0 && !lastAgentMessage) {
+        reject(new Error(`codex CLI exited ${code}: ${stderr.slice(0, 200) || stdout.slice(0, 200)}`));
+        return;
+      }
+      resolve({
+        response: lastAgentMessage || '(no agent message)',
+        inputTokens: usage.input_tokens,
+        outputTokens: usage.output_tokens,
+      });
+    });
+
+    proc.on('error', (err) => {
+      clearTimeout(timer);
+      reject(new Error(`Failed to spawn codex: ${err.message}`));
+    });
+  });
+}
+
+/**
+ * 以 Codex CLI 執行一輪 gap-fill 研究。
+ * 介面與 runGapFillAgent() / runClaudeCliAgent() 相容。
+ */
+export async function runCodexCliAgent(
+  ticker: string,
+  gaps: InitialMaxGaps,
+  round: number,
+  phase: 'gap_fill' | 'polish' = 'gap_fill',
+  noWriteWarning = false,
+): Promise<{ response: string; wroteToMainFile: boolean }> {
+  const mtimeBefore = getMainFileMtime(ticker);
+
+  const prompt = phase === 'polish'
+    ? buildPolishPrompt(ticker, gaps.score)
+    : buildGapFillPrompt(ticker, gaps, round, noWriteWarning);
+
+  const result = await spawnCodex(prompt);
+
+  const mtimeAfter = getMainFileMtime(ticker);
+  const wroteToMainFile = mtimeAfter > mtimeBefore;
+
+  if (result.inputTokens !== undefined) {
+    console.log(`  [codex-cli] tokens in=${result.inputTokens} out=${result.outputTokens ?? 0}`);
+  }
+
+  return { response: result.response, wroteToMainFile };
+}

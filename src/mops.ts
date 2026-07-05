@@ -131,13 +131,15 @@ async function fetchFinancialDocs(ticker: string): Promise<OfficialDoc[]> {
 }
 
 /** 歷史重大訊息（ajax_t05st01）：抓近兩個民國年度，取主旨。 */
-async function fetchAnnouncementDocs(ticker: string): Promise<OfficialDoc[]> {
+async function fetchAnnouncementDocs(ticker: string, market = 'TW'): Promise<OfficialDoc[]> {
   const roc = thisRocYear();
   const lines: string[] = [];
+  // TW（上市 TWSE）→ sii；TWO（上櫃 TPEx）→ otc；其餘保守用 all
+  const typek = market.toUpperCase() === 'TWO' ? 'otc' : market.toUpperCase() === 'TW' ? 'sii' : 'all';
 
   for (const year of [roc, roc - 1]) {
     try {
-      const html = await mopsPost('ajax_t05st01', { co_id: ticker, year: String(year), TYPEK: 'sii', firstin: '1' });
+      const html = await mopsPost('ajax_t05st01', { co_id: ticker, year: String(year), TYPEK: typek, firstin: '1' });
       const text = htmlToText(html);
       if (!text.includes('查無') && text.length > 500) {
         // 每行格式：  6589 | 台康生技 | 115/03/09 | 17:30:17 | 主旨...
@@ -275,6 +277,7 @@ async function fetchEarningsCallDocs(ticker: string): Promise<OfficialDoc[]> {
 export async function fetchOfficialDisclosure(
   ticker: string,
   types: ('conference' | 'financial' | 'annual' | 'revenue' | 'announcement' | 'earningscall')[] = ['conference', 'financial', 'revenue', 'announcement', 'earningscall'],
+  market = 'TW',
 ): Promise<OfficialDoc[]> {
   const results: OfficialDoc[] = [];
 
@@ -286,7 +289,7 @@ export async function fetchOfficialDisclosure(
         case 'financial':
         case 'annual':       docs = await fetchFinancialDocs(ticker); break;
         case 'revenue':      docs = await fetchRevenueDocs(ticker); break;
-        case 'announcement': docs = await fetchAnnouncementDocs(ticker); break;
+        case 'announcement': docs = await fetchAnnouncementDocs(ticker, market); break;
         case 'earningscall': docs = await fetchEarningsCallDocs(ticker); break;
       }
       results.push(...docs);

@@ -194,13 +194,20 @@ export async function chat(
     temperature: options?.temperature,
   };
 
-  // ── Try Google AI Studio first (with retry on 429 rate limit) ──
-  // PRO account has higher quotas — retry up to 3× with 35s backoff before giving up.
+  // ── Try Google AI Studio first (with retry on 429/503) ──
+  // PRO account has higher quotas — retry up to 6× with backoff before giving up.
+  // 503 (overloaded): 每次多等 5s（10s → 15s → 20s → 25s → 30s）
+  // 429 (rate limit): 固定 35s 退避
   if (GOOGLE_STUDIO_KEY && isGoogleModel(requestedModel)) {
     const googleModel = toGoogleModel(requestedModel);
-    const MAX_RETRIES = 3;
+    const MAX_RETRIES_503 = 6;
+    const MAX_RETRIES_429 = 3;
     const RETRY_DELAY_MS = 35_000;
-    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    const BASE_503_DELAY_MS = 10_000;
+    const STEP_503_DELAY_MS = 5_000;
+    let attempt503 = 0;
+    let attempt429 = 0;
+    while (true) {
       try {
         const result = await callEndpoint(
           GOOGLE_STUDIO_URL, GOOGLE_STUDIO_KEY, googleModel,
@@ -212,18 +219,22 @@ export async function chat(
         const msg: string = err.message ?? '';
         const lower = msg.toLowerCase();
         const is429  = msg.includes('429') || lower.includes('quota') || lower.includes('rate');
-        // 503 / overloaded / high demand 為暫時性錯誤，與 429 同樣可重試，
-        // 不應立即 fallback 到爛模型。用較短退避（10s）即可，通常很快恢復。
+        // 503 / overloaded / high demand 為暫時性錯誤，每次多等 5s，最多重試 6 次。
         const is503  = msg.includes('503') || lower.includes('overload') || lower.includes('high demand') || lower.includes('unavailable');
-        const isRetryable = is429 || is503;
         const isTimeout = lower.includes('timeout');
-        if (isRetryable && attempt < MAX_RETRIES) {
-          const delay = is503 ? 10_000 : RETRY_DELAY_MS;
-          console.warn(`  [llm] Google AI Studio ${is503 ? 'overloaded(503)' : 'rate limit'} (attempt ${attempt}/${MAX_RETRIES}) → waiting ${delay / 1000}s before retry…`);
+        if (is503 && attempt503 < MAX_RETRIES_503) {
+          attempt503++;
+          const delay = BASE_503_DELAY_MS + (attempt503 - 1) * STEP_503_DELAY_MS;
+          console.warn(`  [llm] Google AI Studio overloaded(503) (attempt ${attempt503}/${MAX_RETRIES_503}) → waiting ${delay / 1000}s before retry…`);
           await new Promise(r => setTimeout(r, delay));
           continue;
-        } else if (isRetryable) {
-          console.warn(`  [llm] Google AI Studio still failing after ${MAX_RETRIES} attempts → falling back to OpenRouter`);
+        } else if (is429 && attempt429 < MAX_RETRIES_429) {
+          attempt429++;
+          console.warn(`  [llm] Google AI Studio rate limit (attempt ${attempt429}/${MAX_RETRIES_429}) → waiting ${RETRY_DELAY_MS / 1000}s before retry…`);
+          await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
+          continue;
+        } else if (is503 || is429) {
+          console.warn(`  [llm] Google AI Studio still failing after retries → falling back to OpenRouter`);
         } else if (isTimeout) {
           console.warn(`  [llm] Google AI Studio timed out (${GOOGLE_TIMEOUT_MS / 1000}s) → falling back to OpenRouter`);
         } else {

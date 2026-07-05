@@ -53,7 +53,7 @@ const TIER_THRESHOLDS: Record<CapTier, TierThreshold> = {
 
 /** 從報告擷取市值（億元）。容錯「約」「NT$」「逗號」等格式。 */
 function detectMarketCapB(report: string): number | null {
-  const m = report.match(/市值[：:]?\s*(?:約\s*)?(?:NT\$?\s*)?([\d,]+(?:\.\d+)?)\s*億/);
+  const m = report.match(/市值[\s：:\|]*(?:約\s*)?(?:NT\$?\s*)?([\d,]+(?:\.\d+)?)\s*億/);
   return m ? parseFloat(m[1].replace(/,/g, '')) : null;
 }
 

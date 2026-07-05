@@ -7,6 +7,8 @@
     "initial-max": "tsx src/initial-max-runner.ts",
     "score": "tsx src/initial-max-scorer.ts",
     "tw-research": "tsx src/initial-max-runner.ts --market TW",
+    "tw-research-cli": "tsx src/initial-max-runner.ts --market TW --engine claude-cli",
+    "tw-research-codex": "tsx src/initial-max-runner.ts --market TW --engine codex",
     "tw-score": "tsx src/initial-max-scorer.ts --market TW",
     "test-llm": "tsx src/test-llm-layers.ts",
     "update-market-snapshot": "powershell -Command \"$env:NODE_OPTIONS='--use-system-ca'; node scripts/update_market_snapshot.mjs 7740\""
