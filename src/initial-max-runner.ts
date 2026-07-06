@@ -124,6 +124,7 @@ interface RoundResult {
   round: number;
   commit: string;
   score: number;
+  passThreshold: boolean;
   status: 'keep' | 'no_improvement' | 'crash' | 'baseline';
   description: string;
   timestamp: string;
@@ -1082,6 +1083,7 @@ async function main() {
     round: 0,
     commit: gitShortHash(),
     score: baselineScore.total,
+    passThreshold: baselineScore.passThreshold,
     status: 'baseline',
     description: `baseline score ${baselineScore.total}/100`,
     timestamp: new Date().toISOString(),
@@ -1107,6 +1109,7 @@ async function main() {
   // Main loop
   const history: RoundResult[] = [baselineResult];
   let prevScore = baselineScore.total;
+  let lastPassThreshold = baselineScore.passThreshold;
   let plateauCount = 0;
   let lastRoundNoWrite = false;
 
@@ -1157,11 +1160,12 @@ async function main() {
 
       const status: RoundResult['status'] = delta > 0 ? 'keep' : 'no_improvement';
       const result: RoundResult = {
-        round, commit: commitHash, score: newScore.total, status,
+        round, commit: commitHash, score: newScore.total, passThreshold: newScore.passThreshold, status,
         description, timestamp: new Date().toISOString(),
       };
       history.push(result);
       appendTsv(tsvPath, result);
+      lastPassThreshold = newScore.passThreshold;
 
       if (delta > 0) {
         console.log(`✓ IMPROVED by +${delta}`);
@@ -1192,7 +1196,7 @@ async function main() {
     } catch (err: any) {
       console.error(`Round ${round} CRASH: ${err.message}`);
       const result: RoundResult = {
-        round, commit: gitShortHash(), score: prevScore, status: 'crash',
+        round, commit: gitShortHash(), score: prevScore, passThreshold: lastPassThreshold, status: 'crash',
         description: err.message.slice(0, 100), timestamp: new Date().toISOString(),
       };
       history.push(result);
@@ -1227,18 +1231,21 @@ async function main() {
         round: polishRoundId,
         commit: commitHash,
         score: afterPolish.total,
+        passThreshold: afterPolish.passThreshold,
         status: 'keep',
         description: polishDesc,
         timestamp: new Date().toISOString(),
       });
       appendTsv(tsvPath, history[history.length - 1]!);
       prevScore = afterPolish.total;
+      lastPassThreshold = afterPolish.passThreshold;
     } catch (err: any) {
       console.error(`Polish pass CRASH: ${err.message}`);
       const crashResult: RoundResult = {
         round: polishRoundId,
         commit: gitShortHash(),
         score: prevScore,
+        passThreshold: lastPassThreshold,
         status: 'crash',
         description: `polish: ${err.message.slice(0, 80)}`,
         timestamp: new Date().toISOString(),
@@ -1254,6 +1261,7 @@ async function main() {
 
   // Final summary
   const finalScore = history[history.length - 1].score;
+  const finalPassThreshold = history[history.length - 1].passThreshold;
   const kept = history.filter(r => r.status === 'keep').length;
   const noImprove = history.filter(r => r.status === 'no_improvement').length;
   const crashed = history.filter(r => r.status === 'crash').length;
@@ -1263,7 +1271,9 @@ async function main() {
   console.log('╚══════════════════════════════════════╝');
   console.log(`Rounds: ${history.length - 1} | Improved: ${kept} | No-improvement: ${noImprove} | Crashed: ${crashed}`);
   console.log(`Score: ${baselineScore.total} → ${finalScore} (+${finalScore - baselineScore.total})`);
-  console.log(`Status: ${finalScore >= PASS_THRESHOLD ? '✓ PASSED' : '✗ NOT YET (more rounds needed)'}`);
+  // 用真正的 passThreshold（含各維度最低分＋子節覆蓋檢查），不再只比 finalScore>=95——
+  // 後者曾出現總分過門檻但子節仍缺實質內容（如 2.3/2.4/3.2/3.3 待補充）卻誤報 PASSED 的落差。
+  console.log(`Status: ${finalPassThreshold ? '✓ PASSED' : '✗ NOT YET (more rounds needed)'}`);
   console.log(`Results: ${tsvPath}`);
   cleanupTickerScoreAndGapsFiles(ticker);
 }
