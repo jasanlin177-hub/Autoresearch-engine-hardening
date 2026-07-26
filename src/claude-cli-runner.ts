@@ -20,7 +20,13 @@ const PROJECT_ROOT = path.resolve(__dirname, '..');
  * CLI 引擎沒有走 SKILL.md，若不內嵌這份清單，agent 首輪建骨架時會自創編號，
  * 導致 checkAllSectionsCovered 永遠判定 missing、passThreshold 卡死 false。
  */
-const REQUIRED_STRUCTURE = `### 主檔章節結構（強制，編號不可更動或自創）
+const REQUIRED_STRUCTURE = `### 主檔章節結構（強制，順序與編號不可更動或自創）
+主檔最上方（一、環境之前）必須依序有這四個區塊，缺一律視為未達標：
+  IRR 模型與關鍵假設（情境分析表，台幣計價）
+  結論總結（1–2 段）
+  KEY QUESTION
+  評分總表
+接著才是四維框架：
 一、環境
   1.1 產業起源與演進
   1.2 台灣市場定位與競爭格局
@@ -39,7 +45,7 @@ const REQUIRED_STRUCTURE = `### 主檔章節結構（強制，編號不可更動
 四、人
   4.1 CEO 故事線（時間軸）
   4.2 管理團隊
-建立骨架或新增章節時，標題必須是「## 1.1 產業起源與演進」這種格式（編號＋既定標題），不可自訂編號或跳過任何一節。`;
+建立骨架或新增章節時，標題必須是「## 1.1 產業起源與演進」這種格式（編號＋既定標題），不可自訂編號或跳過任何一節，且不可省略最上方四個區塊。`;
 
 export interface InitialMaxGaps {
   round: number;
