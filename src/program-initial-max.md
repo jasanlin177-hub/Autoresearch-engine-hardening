@@ -112,7 +112,7 @@ FUTU 報告（96/100）的特點，供你參考對標：
 - [ ] 前五大客戶集中度（來自年報）
 
 ### 報告輸出路徑
-`data/companies/{代號}/{代號}_TW_Research.md`（取代原 _Initial_MAX.md）
+`data/companies/{代號}/{代號}_Initial_MAX.md`
 
 ### 引言品質標準（台股版）
 - 引言須用「…」或 "…" 包住

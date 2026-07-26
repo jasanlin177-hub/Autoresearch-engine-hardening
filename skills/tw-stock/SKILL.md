@@ -29,12 +29,12 @@ fetch_url(url)                    — 抓取 URL 完整內容（MOPS、TWSE、�
 web_search(query, count)          — 搜尋網頁，最多 5 次/輪
 ninja_api(action, ticker, ...)    — 僅用於有 ADR 之台股（TSM、UMC 等）
 write_research_section(ticker, filename, content, mode, section_anchor?)
-                                  — 寫入 data/companies/{TICKER}/{TICKER}_TW_Research.md
+                                  — 寫入 data/companies/{TICKER}/{TICKER}_Initial_MAX.md
 read_research_file(ticker, filename)
                                   — 讀取現有研究檔案
 ```
 
-**主要輸出檔案**：`data/companies/{代號}/{代號}_TW_Research.md`
+**主要輸出檔案**：`data/companies/{代號}/{代號}_Initial_MAX.md`
 
 ---
 
@@ -131,7 +131,7 @@ CEO 故事線必須涵蓋：
 ## 主檔結構（依序）
 
 ```
-{代號}_TW_Research.md
+{代號}_Initial_MAX.md
 ├── IRR 模型與關鍵假設（情境分析表，台幣計價）
 ├── 結論總結（1–2 段）
 ├── KEY QUESTION
@@ -179,7 +179,7 @@ CEO 故事線必須涵蓋：
 ```json
 {
   "description": "short english description — which gaps were filled",
-  "files_written": ["2330_TW_Research.md", "transcripts/2330_CEO_2024_BWK.md"],
+  "files_written": ["2330_Initial_MAX.md", "transcripts/2330_CEO_2024_BWK.md"],
   "interviews_added": 3,
   "dimensions_addressed": ["生意→月營收", "人→CEO訪談"]
 }
