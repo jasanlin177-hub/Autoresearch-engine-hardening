@@ -12,6 +12,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { spawn } from 'child_process';
 import { chat, geminiGenerateContent } from './llm.js';
+import { fetchLiveMarketCapB } from './tw-data.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '..');
@@ -68,6 +69,24 @@ function capTier(mktCapB: number | null): CapTier {
 /** 主檔必備子節（1.1～4.2），每節皆須有實質內容才達標 */
 const REQUIRED_SECTIONS = ['1.1', '1.2', '1.3', '1.4', '2.1', '2.2', '2.3', '2.4', '2.5', '3.1', '3.2', '3.3', '4.1', '4.2'];
 const MIN_SECTION_CHARS = 80;
+
+/** REQUIRED_SECTIONS → 所屬維度＋標題，供 buildGapsJson 把「整節仍是待補」直接列進 gap 清單（★ = README 必達項）。 */
+const REQUIRED_SECTION_INFO: Record<string, { dimension: '環境' | '生意' | '組織' | '人'; label: string; mandatory: boolean }> = {
+  '1.1': { dimension: '環境', label: '產業起源與演進', mandatory: false },
+  '1.2': { dimension: '環境', label: '台灣市場定位與競爭格局', mandatory: false },
+  '1.3': { dimension: '環境', label: '兩岸地緣政治風險', mandatory: true },
+  '1.4': { dimension: '環境', label: '法規與政策環境', mandatory: false },
+  '2.1': { dimension: '生意', label: '商業模式（≥25則CEO直引言）', mandatory: false },
+  '2.2': { dimension: '生意', label: '財務分析（TIFRS近5–10年）', mandatory: false },
+  '2.3': { dimension: '生意', label: '月營收趨勢（近12個月）', mandatory: true },
+  '2.4': { dimension: '生意', label: '客戶集中度（前五大）', mandatory: true },
+  '2.5': { dimension: '生意', label: '台幣DCF估值', mandatory: true },
+  '3.1': { dimension: '組織', label: '廠區分布（竹科/中科/南科/海外）', mandatory: true },
+  '3.2': { dimension: '組織', label: '研發能力與ESG', mandatory: false },
+  '3.3': { dimension: '組織', label: '公司治理', mandatory: false },
+  '4.1': { dimension: '人', label: 'CEO故事線（時間軸）', mandatory: false },
+  '4.2': { dimension: '人', label: '管理團隊', mandatory: false },
+};
 
 export interface DimensionScore {
   score: number;
@@ -792,9 +811,24 @@ async function medianLlmScore(
 
 // ── Gap builder ──
 
-function buildGapsJson(score: InitialMaxScore, round: number): InitialMaxGaps {
+function buildGapsJson(score: InitialMaxScore, round: number, missingSections: string[] = []): InitialMaxGaps {
   const gaps: GapItem[] = [];
   let priority = 1;
+
+  // 整節仍是「待補」佔位文字的必備子節（1.1～4.2）：criteria key 覆蓋不到的節（如 2.3/2.4/3.2/3.3）
+  // 若不在此明確列出，agent 永遠不會被告知要補，總分再高也會一直卡在骨架階段。
+  // shortfall 給高值（★必達=999，一般=200）確保排序時優先於其他 criteria-based gap。
+  for (const id of missingSections) {
+    const info = REQUIRED_SECTION_INFO[id];
+    if (!info) continue;
+    gaps.push({
+      dimension: info.dimension,
+      item: `${id} ${info.label}${info.mandatory ? '（必達，目前仍是待補佔位文字）' : '（目前仍是待補佔位文字）'}`,
+      current: 0, target: '完整章節內容',
+      shortfall: info.mandatory ? 999 : 200,
+      priority: priority++,
+    });
+  }
 
   // 人維度 (25pts) — 高回報缺口
   const 人訪談Score = score.人.criteria?.['訪談逐字稿'] ?? Math.floor(score.人.score * 0.6);
@@ -858,8 +892,10 @@ export async function scoreCompanyResearch(
   const reportContent = readResearchFiles(ticker);
   const dir = getCompanyDir(ticker);
   // 市值只決定「整體達標門檻」（large/mid/small），不影響任何維度如何給分。
-  // market 旗標只代表交易所，不等於規模——一律以報告中的市值數字分級。
-  const mktCapB = detectMarketCapB(reportContent);
+  // 優先即時查詢 TWSE 真實市值（見 tw-data.ts fetchLiveMarketCapB）；
+  // TPEx 股票或查詢失敗（無 API 支援/網路問題）才退回報告文字中的「市值」正則擷取。
+  const liveMktCapB = await fetchLiveMarketCapB(ticker);
+  const mktCapB = liveMktCapB ?? detectMarketCapB(reportContent);
   const tier = capTier(mktCapB);
   const threshold = TIER_THRESHOLDS[tier];
 
@@ -897,14 +933,6 @@ export async function scoreCompanyResearch(
 
     if (llmResult) {
       score = { ...llmResult, round };
-      const mainFile = path.join(dir, `${ticker}_Initial_MAX.md`);
-      if (fs.existsSync(mainFile)) {
-        const sectionCoverage = checkAllSectionsCovered(fs.readFileSync(mainFile, 'utf-8'));
-        if (!sectionCoverage.allCovered) {
-          score.passThreshold = false;
-          score.環境.gaps = [...score.環境.gaps, `子節未全覆蓋：${sectionCoverage.missing.join('、')} 須有實質內容`];
-        }
-      }
       console.log(`[scorer] LLM score: ${score.total}/100 (環境:${score.環境.score} 生意:${score.生意.score} 組織:${score.組織.score} 人:${score.人.score})`);
     } else {
       // Heuristic fallback
@@ -914,7 +942,20 @@ export async function scoreCompanyResearch(
     }
   }
 
-  const gaps = buildGapsJson(score, round);
+  // 子節覆蓋檢查：不論走 LLM 或 heuristic 都要查，missing 清單會直接餵進 buildGapsJson，
+  // 否則 criteria key 覆蓋不到的節（2.3/2.4/3.2/3.3 等）永遠不會被排進 agent 待辦。
+  let missingSections: string[] = [];
+  const mainFile = path.join(dir, `${ticker}_Initial_MAX.md`);
+  if (fs.existsSync(mainFile)) {
+    const sectionCoverage = checkAllSectionsCovered(fs.readFileSync(mainFile, 'utf-8'));
+    missingSections = sectionCoverage.missing;
+    if (!sectionCoverage.allCovered) {
+      score.passThreshold = false;
+      score.環境.gaps = [...score.環境.gaps, `子節未全覆蓋：${sectionCoverage.missing.join('、')} 須有實質內容`];
+    }
+  }
+
+  const gaps = buildGapsJson(score, round, missingSections);
 
   // Write score and gaps files
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });

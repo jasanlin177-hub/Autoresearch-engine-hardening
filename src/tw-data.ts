@@ -20,6 +20,57 @@ export function normalizeTWTicker(ticker: string): string {
   return ticker.trim().toUpperCase().replace(/\.(TW|TWO)$/, '');
 }
 
+// ─── Live market cap (real query, not agent-prompt) ────────────────────────────
+
+/** in-process cache：同一輪程序內同一 ticker 只查一次（市值不會秒級變動）。 */
+const marketCapCache = new Map<string, number | null>();
+/** 上市公司基本資料（含已發行股數）整表快取，避免每個 ticker 都重抓 1MB+ JSON。 */
+let twseCompanyListCache: any[] | null = null;
+
+/**
+ * 即時查詢 TWSE 上市股票市值（億元）＝最新成交價 × 已發行普通股數。
+ * 資料源：mis.twse.com.tw（即時股價）＋ openapi.twse.com.tw（t187ap03_L 已發行股數）。
+ * 僅支援 TWSE 上市股票；TPEx 上櫃股票、查無資料、或任一 API 失敗一律回傳 null，
+ * 呼叫端應 fallback 回報告文字中的「市值」正則擷取。
+ */
+export async function fetchLiveMarketCapB(ticker: string): Promise<number | null> {
+  const id = normalizeTWTicker(ticker);
+  if (marketCapCache.has(id)) return marketCapCache.get(id)!;
+
+  const result = await (async (): Promise<number | null> => {
+    try {
+      const priceRes = await fetch(
+        `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_${id}.tw&json=1&delay=0`,
+        { signal: AbortSignal.timeout(8000) },
+      );
+      if (!priceRes.ok) return null;
+      const priceJson: any = await priceRes.json();
+      const row = priceJson?.msgArray?.[0];
+      const price = row ? parseFloat(row.z || row.y || '') : NaN;
+      if (!row || !isFinite(price) || price <= 0) return null;
+
+      if (!twseCompanyListCache) {
+        const listRes = await fetch(
+          'https://openapi.twse.com.tw/v1/opendata/t187ap03_L',
+          { signal: AbortSignal.timeout(15000) },
+        );
+        if (!listRes.ok) return null;
+        twseCompanyListCache = await listRes.json();
+      }
+      const company = twseCompanyListCache?.find((c) => c['公司代號'] === id);
+      const shares = company ? parseFloat(company['已發行普通股數或TDR原股發行股數'] ?? '') : NaN;
+      if (!isFinite(shares) || shares <= 0) return null;
+
+      return Math.round(((price * shares) / 1e8) * 10) / 10; // 億元，取一位小數
+    } catch {
+      return null;
+    }
+  })();
+
+  marketCapCache.set(id, result);
+  return result;
+}
+
 // ─── Data fetching (returns fetch_url instructions) ───────────────────────────
 
 /**
