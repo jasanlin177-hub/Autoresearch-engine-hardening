@@ -24,9 +24,9 @@
 ## 安裝
 
 ```bash
-git clone https://github.com/jasanlin177-hub/Autoresearch-engine-hardening.git
-cd Autoresearch-engine-hardening
-git checkout taiwan-stock
+git clone https://github.com/jasanlin177-hub/TaiEquityautoresearch-hardening.git
+cd TaiEquityautoresearch-hardening
+# claude-cli-engine 為預設分支，clone 後即在此分支上
 npm install
 pip install reportlab python-docx yfinance beautifulsoup4 requests
 ```
@@ -143,7 +143,7 @@ python scripts/generate_word.py data/companies/7738/7738_Initial_MAX.md 7738_Rep
 | 中型（30–500 億）| ≥ 75 | ≥ 14 | ≥ 25 | ≥ 13 | ≥ 14 |
 | 小型（< 30 億）  | ≥ 60 | ≥ 12 | ≥ 22 | ≥ 10 | ≥ 12 |
 
-> 市值由研究報告中的「市值 ×× 億」自動擷取，未能擷取時套用中型門檻。
+> 市值優先即時查詢 TWSE API（`mis.twse.com.tw` 即時股價 × `openapi.twse.com.tw` t187ap03_L 已發行股數，僅支援上市股票）；查不到（TPEx 上櫃股票、網路失敗）才退回從報告文字中擷取「市值 ×× 億」，兩者皆未能取得時套用中型門檻。
 
 ### 各維度滿分
 
@@ -196,11 +196,18 @@ python scripts/generate_word.py data/companies/7738/7738_Initial_MAX.md 7738_Rep
 ## 報告結構
 
 ```
-封面
+封面（Word 報告限定，由 generate_word.py 產生）
   ├── 公司名稱 + 股票代號
   ├── 即時股價 / 市值 / 產業 / 產出日期       ← Yahoo Finance 即時抓取
   ├── 財務指標帶（TTM 營收成長、P/E、ROE、PEG、P/B）
-  └── 季度 EPS / 52 週高低
+  ├── 季度 EPS / 52 週高低
+  └── 目錄（Word TOC 欄位）+ 每頁 header/footer（公司/代號 + 頁碼）
+
+主檔（{ticker}_Initial_MAX.md）開頭，四維框架之前：
+  IRR 模型與關鍵假設（情境分析表，台幣計價）
+  結論總結（1–2 段）
+  KEY QUESTION
+  評分總表
 
 一、環境分析
   1.1 產業概況與總體經濟
@@ -223,28 +230,31 @@ python scripts/generate_word.py data/companies/7738/7738_Initial_MAX.md 7738_Rep
 四、人的分析
   4.1 CEO 背景與訪談記錄
   4.2 管理團隊與文化
-
-結論 / IRR 模型總覽
 ```
+
+> API 引擎（`runGapFillAgent`）靠 SKILL.md system prompt 強制此結構；CLI 引擎（`claude-cli` / `codex`）沒有走 SKILL.md，改由 `codex-cli-runner.ts` / `claude-cli-runner.ts` 內建的 `REQUIRED_STRUCTURE` 常數強制同一份順序，兩者需保持一致。
 
 ---
 
 ## 專案結構
 
 ```
-TaiEquityautoresearch/
+TaiEquityautoresearch-hardening/
 ├── src/
 │   ├── initial-max-runner.ts   # 主研究迴圈（多輪迭代 + 成本控制）
 │   ├── initial-max-scorer.ts   # 四維評分引擎（市值分級 + 中位數取樣）
+│   ├── codex-cli-runner.ts     # Codex CLI 研究引擎（--engine codex）
+│   ├── claude-cli-runner.ts    # Claude Code CLI 研究引擎（--engine claude-cli）
+│   ├── pdf-prefetch.ts         # 主檔內 PDF 連結本機預先下載＋解析
 │   ├── mops.ts                 # MOPS / Poorstock 資料抓取（財報、法說、重大訊息）
 │   ├── llm.ts                  # LLM 呼叫層（三層 fallback）
-│   └── tw-data.ts              # 台股輔助工具
+│   └── tw-data.ts              # 台股輔助工具 + fetchLiveMarketCapB（即時市值查詢）
 ├── skills/
 │   ├── tw-stock/SKILL.md       # 台股研究指令（研究 prompt）
 │   └── initial-max/SKILL.md    # 迭代研究框架定義
 ├── scripts/
 │   ├── generate_pdf.py         # PDF 報告產生器（繁中、表格、超連結）
-│   ├── generate_word.py        # Word 報告產生器（支援任意 ticker）
+│   ├── generate_word.py        # Word 報告產生器（封面即時財務 + 目錄 + header/footer，支援任意 ticker）
 │   ├── fetch_financials.py     # Yahoo Finance 財務資料抓取
 │   └── report.css              # HTML 報告樣式
 ├── data/companies/<ticker>/    # （gitignored）
