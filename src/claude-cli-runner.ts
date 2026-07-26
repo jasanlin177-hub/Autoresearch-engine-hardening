@@ -14,6 +14,33 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 
+/**
+ * 主檔章節結構（固定 1.1～4.2 編號，對應 scorer 的 REQUIRED_SECTIONS）。
+ * API 引擎（runGapFillAgent）靠 SKILL.md system prompt 強制此結構；
+ * CLI 引擎沒有走 SKILL.md，若不內嵌這份清單，agent 首輪建骨架時會自創編號，
+ * 導致 checkAllSectionsCovered 永遠判定 missing、passThreshold 卡死 false。
+ */
+const REQUIRED_STRUCTURE = `### 主檔章節結構（強制，編號不可更動或自創）
+一、環境
+  1.1 產業起源與演進
+  1.2 台灣市場定位與競爭格局
+  1.3 兩岸地緣政治風險（必達）
+  1.4 法規與政策環境
+二、生意
+  2.1 商業模式（≥25 則 CEO 直引言）
+  2.2 財務分析（TIFRS 近 5–10 年）
+  2.3 月營收趨勢（近 12 個月，必達）
+  2.4 客戶集中度（前五大，必達）
+  2.5 台幣 DCF 估值（必達）
+三、組織
+  3.1 廠區分布（竹科/中科/南科/海外，必達）
+  3.2 研發能力與 ESG
+  3.3 公司治理
+四、人
+  4.1 CEO 故事線（時間軸）
+  4.2 管理團隊
+建立骨架或新增章節時，標題必須是「## 1.1 產業起源與演進」這種格式（編號＋既定標題），不可自訂編號或跳過任何一節。`;
+
 export interface InitialMaxGaps {
   round: number;
   score: number;
@@ -105,6 +132,8 @@ ${topGaps}
 
 ### 完成後輸出 JSON（最後一行）：
 {"description": "補充了哪些內容（過程紀錄只寫這裡，不寫主檔正文）", "sections_written": ["1.1", "2.2"], "interviews_added": 數字}
+
+${REQUIRED_STRUCTURE}
 ${mainFileText}${pdfAttachment}`;
 
   return prompt;
