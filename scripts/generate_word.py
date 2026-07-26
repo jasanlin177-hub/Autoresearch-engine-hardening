@@ -51,6 +51,65 @@ def add_hyperlink(paragraph, text, url):
     return hyperlink
 
 
+def add_toc_field(paragraph):
+    """Insert a Word TOC field (updates via right-click → 更新功能變數 in Word)."""
+    run = paragraph.add_run()
+    fld_begin = OxmlElement('w:fldChar')
+    fld_begin.set(qn('w:fldCharType'), 'begin')
+    instr = OxmlElement('w:instrText')
+    instr.set(qn('xml:space'), 'preserve')
+    instr.text = r'TOC \o "1-3" \h \z \u'
+    fld_sep = OxmlElement('w:fldChar')
+    fld_sep.set(qn('w:fldCharType'), 'separate')
+    hint = OxmlElement('w:t')
+    hint.text = '更新目錄請在 Word 中按右鍵並選擇「更新功能變數」。'
+    fld_sep.append(hint)
+    fld_end = OxmlElement('w:fldChar')
+    fld_end.set(qn('w:fldCharType'), 'end')
+    run._r.append(fld_begin)
+    run._r.append(instr)
+    run._r.append(fld_sep)
+    run._r.append(fld_end)
+
+
+def add_page_number_field(paragraph):
+    run = paragraph.add_run()
+    fld_begin = OxmlElement('w:fldChar')
+    fld_begin.set(qn('w:fldCharType'), 'begin')
+    instr = OxmlElement('w:instrText')
+    instr.set(qn('xml:space'), 'preserve')
+    instr.text = 'PAGE'
+    fld_end = OxmlElement('w:fldChar')
+    fld_end.set(qn('w:fldCharType'), 'end')
+    run._r.append(fld_begin)
+    run._r.append(instr)
+    run._r.append(fld_end)
+
+
+def add_header_footer(doc, ticker, company_name):
+    """Add a consistent header (company/ticker) and footer (page number) to every section."""
+    for section in doc.sections:
+        header_para = section.header.paragraphs[0]
+        header_para.text = f'TaiEquityautoresearch｜{company_name}（{ticker}）'
+        header_para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        for run in header_para.runs:
+            run.font.size = Pt(9)
+            run.font.color.rgb = RGBColor(0x88, 0x88, 0x88)
+            run.font.name = '微軟正黑體'
+            run._element.rPr.rFonts.set(qn('w:eastAsia'), '微軟正黑體')
+
+        footer_para = section.footer.paragraphs[0]
+        footer_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        footer_para.add_run('第 ')
+        add_page_number_field(footer_para)
+        footer_para.add_run(' 頁')
+        for run in footer_para.runs:
+            run.font.size = Pt(9)
+            run.font.color.rgb = RGBColor(0x88, 0x88, 0x88)
+            run.font.name = '微軟正黑體'
+            run._element.rPr.rFonts.set(qn('w:eastAsia'), '微軟正黑體')
+
+
 def set_cell_bg(cell, hex_color):
     """Set table cell background color."""
     tc = cell._tc
@@ -339,6 +398,20 @@ def build_word(md_path, out_path, ticker=None, company_name=None, market='TWO'):
     # Page break after cover
     doc.add_page_break()
 
+    # ── Table of contents page ────────────────────────────────────────────────
+    toc_title = doc.add_paragraph()
+    toc_title_run = toc_title.add_run('目錄')
+    toc_title_run.bold = True
+    toc_title_run.font.size = Pt(16)
+    toc_title_run.font.name = '微軟正黑體'
+    toc_title_run._element.rPr.rFonts.set(qn('w:eastAsia'), '微軟正黑體')
+    toc_title.paragraph_format.space_after = Pt(8)
+
+    toc_para = doc.add_paragraph()
+    add_toc_field(toc_para)
+
+    doc.add_page_break()
+
     lines = raw.split('\n')
     i = 0
 
@@ -524,6 +597,8 @@ def build_word(md_path, out_path, ticker=None, company_name=None, market='TWO'):
             run.font.name = '微軟正黑體'
             run._element.rPr.rFonts.set(qn('w:eastAsia'), '微軟正黑體')
         i += 1
+
+    add_header_footer(doc, _ticker, _company)
 
     doc.save(out_path)
     print(f'[OK] Word generated: {out_path}')
